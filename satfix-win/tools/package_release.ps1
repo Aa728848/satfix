@@ -2,17 +2,27 @@
 # 打发布包：按手册 §10.1/§10.2 产出 zip + .sha256。
 #
 # 用法：
-#   .\tools\package_release.ps1                 # 版本从 plugin\stl-plugin.json 读
-#   .\tools\package_release.ps1 -OutDir ..\rel  # 指定输出目录
+#   .\tools\package_release.ps1                    # 版本从 plugin\stl-plugin.json 读
+#   .\tools\package_release.ps1 -Mode shadow       # 显式要求影子模式
+#   .\tools\package_release.ps1 -Mode write-back   # 显式要求回写模式（发布用）
 #
 # 为什么单独一个脚本而不是塞进 build.ps1：
-#   build.ps1 只管「编译 + 自测 + 组装 dist\satfix\」；发布涉及 tag 与版本号一致性，
-#   是另一个动作。手册 §13 要求「标签 = v + version」，这个脚本把那个检查做在打包时，
-#   免得打出一个和清单版本对不上的包。
+#   build.ps1 只管「编译 + 自测 + 组装 dist\satfix\」；发布涉及 tag、版本号一致性和
+#   **构建模式**，是另一个动作。手册 §13 要求「标签 = v + version」，
+#   而这个脚本把三件事都查在打包时：
+#     1. 标签 = v + version
+#     2. 包内没有 config\、logs\
+#     3. DLL 的构建模式与要求一致
+#
+# 第 3 条为什么必要：曾经发过一个「以为是影子版、其实是回写版」的包。
+# 两种构建的 DLL 大小几乎相同，只看大小/时间分不出来 —— 只能读打进二进制的 marker。
+# 默认要求 write-back（发布给用户的就该是能真正修数值的版本）。
 
 [CmdletBinding()]
 param(
     [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release'),
+    [ValidateSet('write-back', 'shadow', 'any')]
+    [string]$Mode = 'write-back',
     [string]$Exe    = 'D:\Steam\steamapps\common\Stellaris\stellaris.exe'
 )
 
@@ -20,11 +30,32 @@ $ErrorActionPreference = 'Stop'
 $Here = $PSScriptRoot
 $Root = Split-Path -Parent $Here
 $Dist = Join-Path $Root 'dist\satfix'
+$Dll  = Join-Path $Dist 'satfix.dll'
 
-if (-not (Test-Path (Join-Path $Dist 'satfix.dll'))) {
-    throw "没有找到 $Dist\satfix.dll —— 先跑 .\build.ps1 组装发布包。"
+if (-not (Test-Path $Dll)) {
+    throw "没有找到 $Dll —— 先跑 .\build.ps1（发布用 .\build.ps1 -Replace）组装发布包。"
 }
 
+# ---- 构建模式自检（读打进二进制的 marker，不靠记性）------------------------
+$bytes = [System.IO.File]::ReadAllBytes($Dll)
+$text  = [System.Text.Encoding]::ASCII.GetString($bytes)
+$isWriteBack = $text.Contains('satfix-build-mode:write-back')
+$isShadow    = $text.Contains('satfix-build-mode:shadow')
+if (-not $isWriteBack -and -not $isShadow) {
+    throw "DLL 里没有构建模式 marker —— 这个 DLL 是加 marker 之前编的，重新构建。"
+}
+$actual = if ($isWriteBack) { 'write-back' } else { 'shadow' }
+
+Write-Host "[release] 构建模式: $actual（要求 $Mode）"
+if ($Mode -ne 'any' -and $actual -ne $Mode) {
+    if ($Mode -eq 'write-back') {
+        throw "要发布回写版，但 DLL 是影子版。用 .\build.ps1 -Replace 重新构建。"
+    } else {
+        throw "要求影子版，但 DLL 是回写版。用 .\build.ps1（不加 -Replace）重新构建。"
+    }
+}
+
+# ---- 清单 ----------------------------------------------------------------
 $manifest = Get-Content (Join-Path $Dist 'stl-plugin.json') -Raw | ConvertFrom-Json
 $version  = $manifest.version
 if (-not $version) { throw '清单里没有 version。' }
@@ -38,11 +69,12 @@ foreach ($c in $manifest.config) {
     if (-not (Test-Path $def)) { throw "清单声明的默认文件不在包里: $($c.default)" }
 }
 
+# ---- 打包 ----------------------------------------------------------------
 $name = "satfix-v$version"
 $stage = Join-Path $OutDir "stage\$name"
 New-Item -ItemType Directory -Force (Join-Path $stage 'defaults') | Out-Null
 Copy-Item (Join-Path $Dist 'stl-plugin.json') $stage
-Copy-Item (Join-Path $Dist 'satfix.dll') $stage
+Copy-Item $Dll $stage
 Copy-Item (Join-Path $Dist 'defaults\*') (Join-Path $stage 'defaults')
 
 $zip = Join-Path $OutDir "$name.zip"
@@ -57,4 +89,4 @@ Write-Host "[release] sha256 $hash"
 Write-Host "[release] 标签应为 v$version（手册 §13：标签 = v + version）"
 Write-Host ""
 Write-Host "发布："
-Write-Host "    gh release create v$version `"$name.zip`" `"$name.zip.sha256`" --title `"satfix v$version`" --notes `"...`""
+Write-Host "    gh release create v$version `"$name.zip`" `"$name.zip.sha256`" --title `"satfix v$version`" --notes-file notes.md"

@@ -53,6 +53,17 @@
 #define SATFIX_REPLACE 0
 #endif
 
+/// 构建模式标记：**打进二进制**，便于用字节搜索当场确认某个 DLL 是哪种模式。
+///
+/// 为什么要这个：发布过一次「以为是影子版、其实是回写版」的包 ——
+/// 两种构建的 DLL 大小完全相同（323072 B），只看大小/时间分不出来，
+/// 只能靠记性，而记性错了。有这个 marker 就能一条命令验出来。
+/// tools/package_release.ps1 会读它并在打包时报告模式。
+// 用 const char*（不是数组）：三目两个分支的字面量长度不同，
+// 声明成数组会报 C2440「无法从 const char* 转换为 const char[]」。
+const char* const kBuildMode =
+    SATFIX_REPLACE ? "satfix-build-mode:write-back" : "satfix-build-mode:shadow";
+
 #ifndef SATFIX_MAX_LOGS
 // 500 行在开心跳时会不够用（实测：20000 次调用一块，几十秒就写满）。
 // 提到 4000：既能容纳一整局的心跳，也不会让日志无限增长。
@@ -1286,7 +1297,7 @@ void install_hooks() {
     whk::set_logger(&whk_log);
 
     // ---- 第一行记版本/路径/构建（手册 9.1）----
-    logf("satfix-win 0.2.0  REPLACE=%d", SATFIX_REPLACE);
+    logf("satfix-win 0.2.0  REPLACE=%d  %s", SATFIX_REPLACE, kBuildMode);
     {
         wchar_t exe[MAX_PATH * 2] = {};
         GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));

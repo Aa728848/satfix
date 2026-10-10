@@ -41,8 +41,8 @@ Stellaris 的定点数用 `int64` 存，1.0 记作 `100000`。上限是 `9.22e18
 
 ```powershell
 cd satfix-win
-.\build.ps1                     # 编译 + 跑 4 套自测（25/25 + 58/58 + 14组 + 24/24）
-.\build.ps1 -Replace            # 额外打开回写（会改数值，见下）
+.\build.ps1                     # 影子模式：编译 + 跑 4 套自测（25/25 + 58/58 + 14组 + 24/24）
+.\build.ps1 -Replace            # 回写模式：发布用这个（会改数值，见下）
 ```
 
 打发布包（按[插件手册](https://github.com/Yidhar/stellaris-launcher/blob/main/docs/PLUGIN_HANDBOOK.zh-CN.md)
@@ -74,17 +74,31 @@ LD_PRELOAD=$PWD/sat_guard.so ./stellaris
 
 ## 两种模式（重要）
 
-默认编译出来是**影子模式**（`REPLACE=0`）：只**检出并记录**分歧，**不改任何数值**。
+| 模式 | 编译 | 行为 | 用途 |
+|---|---|---|---|
+| **回写** | `-Replace` | 检出溢出时**把值改写成饱和值** | **发布给用户的版本** |
+| 影子 | 默认 | 只**检出并记录**，不改数值 | 我们自己的测试 |
 
-要让插件真正把 wrap 掉的值纠正成饱和值，必须用 `-Replace`（Linux 侧 `SATFIX_REPLACE=1`）
-重新编译。这是**编译期**开关，故意不做成配置项 —— 避免手动注入时误改存档。
+这是**编译期**开关（Linux 侧 `SATFIX_REPLACE=1`），故意不做成配置项 ——
+避免手动注入时误改存档。
+
+**怎么当场确认一个 DLL 是哪种模式**：每种构建都往二进制里打了一个 marker，
+字节搜索即可，不用靠记性（两种 DLL 大小几乎相同）：
+
+```
+satfix-build-mode:write-back     回写
+satfix-build-mode:shadow         影子
+```
+
+日志首行也会写出来：`satfix-win 0.2.0  REPLACE=1  satfix-build-mode:write-back`。
+`tools/package_release.ps1` 默认**要求 write-back**，打错模式会直接拒绝打包。
 
 回写路径有端到端验证（同一构建脚本只差一个开关）：
 
 | 构建 | `GetRounded(INT64_MAX)` 返回 | 含义 |
 |---|---|---|
-| `REPLACE=0` | `-92233720368547` | 游戏 wrap 后的值（就是那个 bug） |
-| `REPLACE=1` | `+92233720368547` | **饱和值（被纠正了）** |
+| shadow | `-92233720368547` | 游戏 wrap 后的值（就是那个 bug） |
+| **write-back** | `+92233720368547` | **饱和值（被纠正了）** |
 
 ## 定位方法（Windows 侧）
 
