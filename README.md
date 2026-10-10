@@ -159,11 +159,23 @@ satfix-win/                  Windows 侧（Launcher DLL 插件）
 所以启动器插件页会对它检查更新。发布流程（手册 §10.2）：
 
 ```powershell
-.\satfix-win\tools\package_release.ps1          # 产出 release\satfix-v<版本>.zip + .sha256
-gh release create v<版本> <zip> <zip>.sha256      # 正式发布（非草稿、非预发布）
+.\satfix-win\tools\package_release.ps1
+#   产出 release\satfix-v<版本>.zip + .sha256 + .zip.notes.md
+gh release create v<版本> <zip> <zip>.sha256 --notes-file <zip>.notes.md
 ```
 
 标签必须等于 `v` + 清单里的 `version`，附件名要匹配 `update.asset`。
+
+打包脚本会当场查四件事，任一不过就拒绝出包：
+
+1. 标签 = `v` + `version`；
+2. 包内没有 `config\`、`logs\`（手册 §10.1）；
+3. **DLL 的构建模式** —— 默认要求 `write-back`，打出影子版会被拒；
+4. `satfix-win/RELEASE_NOTES.md` 里有这个版本的那一节。
+
+发布说明的唯一来源是 [`satfix-win/RELEASE_NOTES.md`](satfix-win/RELEASE_NOTES.md)，
+脚本会抽出对应小节写成 `.notes.md`。**不要在 GitHub 网页上直接改说明** ——
+否则下次发布会被覆盖，而且没有版本记录。
 
 > **注意**：仓库里**不含**预编译的 DLL（`satfix.dll` 被 gitignore）。
 > 直接用请从 Releases 下载；自行编译需要 VS2022 BuildTools + Windows SDK。

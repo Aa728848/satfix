@@ -1,22 +1,24 @@
 #!/usr/bin/env pwsh
-# 打发布包：按手册 §10.1/§10.2 产出 zip + .sha256。
+# 打发布包：按手册 §10.1/§10.2 产出 zip + .sha256 + 该版本的发布说明。
 #
 # 用法：
 #   .\tools\package_release.ps1                    # 版本从 plugin\stl-plugin.json 读
-#   .\tools\package_release.ps1 -Mode shadow       # 显式要求影子模式
+#   .\tools\package_release.ps1 -Mode shadow       # 显式要求影子模式（自测用）
 #   .\tools\package_release.ps1 -Mode write-back   # 显式要求回写模式（发布用）
 #
 # 为什么单独一个脚本而不是塞进 build.ps1：
-#   build.ps1 只管「编译 + 自测 + 组装 dist\satfix\」；发布涉及 tag、版本号一致性和
-#   **构建模式**，是另一个动作。手册 §13 要求「标签 = v + version」，
-#   而这个脚本把三件事都查在打包时：
+#   build.ps1 只管「编译 + 自测 + 组装 dist\satfix\」；发布涉及 tag、版本号一致性、
+#   **构建模式**和**发布说明**，是另一个动作。这个脚本把四件事都查在打包时：
 #     1. 标签 = v + version
 #     2. 包内没有 config\、logs\
 #     3. DLL 的构建模式与要求一致
+#     4. RELEASE_NOTES.md 里有这个版本的那一节（抽出来写成 <zip>.notes.md）
 #
 # 第 3 条为什么必要：曾经发过一个「以为是影子版、其实是回写版」的包。
 # 两种构建的 DLL 大小几乎相同，只看大小/时间分不出来 —— 只能读打进二进制的 marker。
-# 默认要求 write-back（发布给用户的就该是能真正修数值的版本）。
+#
+# 第 4 条为什么必要：发布说明以前只存在于 GitHub 网页上，本地没有副本，
+# 改错了没法回溯。现在唯一来源是 satfix-win\RELEASE_NOTES.md，发布时自动抽出对应小节。
 
 [CmdletBinding()]
 param(
@@ -69,6 +71,26 @@ foreach ($c in $manifest.config) {
     if (-not (Test-Path $def)) { throw "清单声明的默认文件不在包里: $($c.default)" }
 }
 
+# ---- 发布说明：抽出这个版本的那一节 --------------------------------------
+$notesAll = Join-Path $Root 'RELEASE_NOTES.md'
+if (-not (Test-Path $notesAll)) { throw "找不到 $notesAll —— 发布说明必须有。" }
+$lines = Get-Content $notesAll
+$head  = "## v$version"
+$start = -1
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i].Trim() -eq $head) { $start = $i; break }
+}
+if ($start -lt 0) {
+    throw "$notesAll 里没有「$head」这一节 —— 发布前先补上这个版本的说明。"
+}
+$end = $lines.Count
+for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^## v') { $end = $i; break }
+}
+$body = ($lines[($start + 1)..($end - 1)] -join "`n").Trim()
+if (-not $body) { throw "$head 这一节是空的。" }
+Write-Host "[release] 发布说明: $head（$($end - $start - 1) 行）"
+
 # ---- 打包 ----------------------------------------------------------------
 $name = "satfix-v$version"
 $stage = Join-Path $OutDir "stage\$name"
@@ -84,9 +106,13 @@ Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 "$hash  $name.zip" | Set-Content -Encoding ascii "$zip.sha256"
 
+# 发布说明也落一份在产物旁边，发 Release 时用 --notes-file 指向它。
+# 用 UTF-8 无 BOM 写：gh 会把 BOM 当成正文的一部分。
+[System.IO.File]::WriteAllText("$zip.notes.md", $body, (New-Object System.Text.UTF8Encoding $false))
+
 Write-Host "[release] $zip"
 Write-Host "[release] sha256 $hash"
-Write-Host "[release] 标签应为 v$version（手册 §13：标签 = v + version）"
+Write-Host "[release] 说明 $zip.notes.md"
 Write-Host ""
 Write-Host "发布："
-Write-Host "    gh release create v$version `"$name.zip`" `"$name.zip.sha256`" --title `"satfix v$version`" --notes-file notes.md"
+Write-Host "    gh release create v$version `"$name.zip`" `"$name.zip.sha256`" --title `"satfix v$version`" --notes-file `"$name.zip.notes.md`""
