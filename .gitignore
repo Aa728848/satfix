@@ -38,3 +38,9 @@ __pycache__/
 .vscode/
 Thumbs.db
 desktop.ini
+
+# Linux 侧 hooklib 的构建产物（无扩展名，靠上面 *.so 之类的规则漏掉了）
+hooklib/debug_hook
+hooklib/test_shk
+hooklib/test/fake_game
+hooklib/test/test_preload.so
