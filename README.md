@@ -45,15 +45,24 @@ cd satfix-win
 .\build.ps1 -Replace            # 额外打开回写（会改数值，见下）
 ```
 
+打发布包（按[插件手册](https://github.com/Yidhar/stellaris-launcher/blob/main/docs/PLUGIN_HANDBOOK.zh-CN.md)
+§10 产出 zip + `.sha256`）：
+
+```powershell
+.\tools\package_release.ps1
+```
+
 然后用 [Stellaris Launcher](https://github.com/Yidhar/stellaris-launcher) 安装：
 
 ```powershell
-stl plugin install .\plugin --link
+stl plugin install .\plugin --link     # 开发：链接，重编译即生效
 stl plugin enable satfix
 stl launch
 ```
 
-日志在 `plugin\logs\satfix.log`。
+日志在 `plugin\logs\satfix.log`。也可以直接从
+[Releases](https://github.com/Aa728848/satfix/releases) 下载 zip 解压到
+`Documents\Paradox Interactive\Stellaris\plugins\satfix\`，或让启动器自动更新。
 
 ### Linux
 
@@ -123,6 +132,52 @@ satfix-win/                  Windows 侧（Launcher DLL 插件）
   build.ps1                  一条命令：编译 + 4 套自测 + 打包
   EVIDENCE_live_gameplay.txt 实机证据（含每一轮的方法与被证伪的思路）
 ```
+
+## 发布与自动更新
+
+清单里已声明自动更新所需的字段：
+
+```json
+"update":   { "github": "Aa728848/satfix", "asset": "satfix-*.zip" },
+"homepage": "https://github.com/Aa728848/satfix"
+```
+
+所以启动器插件页会对它检查更新。发布流程（手册 §10.2）：
+
+```powershell
+.\satfix-win\tools\package_release.ps1          # 产出 release\satfix-v<版本>.zip + .sha256
+gh release create v<版本> <zip> <zip>.sha256      # 正式发布（非草稿、非预发布）
+```
+
+标签必须等于 `v` + 清单里的 `version`，附件名要匹配 `update.asset`。
+
+> **注意**：仓库里**不含**预编译的 DLL（`satfix.dll` 被 gitignore）。
+> 直接用请从 Releases 下载；自行编译需要 VS2022 BuildTools + Windows SDK。
+
+## 合规性
+
+本插件按 [插件手册 v2](https://github.com/Yidhar/stellaris-launcher/blob/main/docs/PLUGIN_HANDBOOK.zh-CN.md)
+实现，逐条对照：
+
+| 手册 | 要求 | 实现 |
+|---|---|---|
+| 6.1 | `DllMain` 只创建线程 | 只 `CreateThread`，不等待/不加载库/不碰引擎 |
+| 6.2 | 从模块路径找插件文件夹 | `GetModuleHandleExW` + `GetModuleFileNameW` |
+| 6.3 | 引擎代码只在游戏主线程 | detour 里只做原子写，重活丢给主线程泵 |
+| 6.4 | 原始内存读取有 SEH | `winhook::safe_read`；坏指针停用该目标并记日志 |
+| 6.5 | 钩子调原函数、不动他人钩子 | 蹦床转发；`uninstall` 只用于自测 |
+| 6.6 | 不卸载自己 | 不调用 `FreeLibraryAndExitThread` |
+| 6.7 | `/MT` 静态运行库、x64、不弹控制台 | `/MT`；x64；无 `AllocConsole` |
+| 7 | 两层版本检查 | 清单列 `exe_timestamps` + DLL 自己比对 PE 时间戳与序言签名 |
+| 8 | 读 `config\`、缺失用内置默认值、热重载 | 每 2 秒看修改时间 |
+| 9.1 | 日志写 `logs\`、运行中可读、有上限 | 见下方说明 |
+| 10.1 | 包内无 `config\`/`logs\` | `tools/check_plugin_pkg.py` 守着（23 项） |
+
+**一处有意的偏离（9.1）**：手册建议 `_wfsopen(..., _SH_DENYWR)`，实测在本机
+`_wfopen_s` 与 `_SH_DENYWR` 都返回 `EACCES`，而 Win32 层
+`CreateFileW(GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE)` 能正常读。
+所以改用 `_wsopen_s` + 显式 `_SH_DENYNO` —— **意图相同（允许游戏运行时读日志），
+手段按实测调整**，并由 `test_load_plugin` 的可读性断言守住。
 
 ## 限制
 

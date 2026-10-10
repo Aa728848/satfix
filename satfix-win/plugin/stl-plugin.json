@@ -1,0 +1,29 @@
+{
+  "schema": 2,
+  "id": "satfix",
+  "name": "satfix — 定点溢出守卫",
+  "version": "0.2.0",
+  "description": "挂钩 Stellaris 的定点算术出口，检出并（可选）修复 int64 溢出。默认影子模式：只记录，不改数值。",
+  "dll": "satfix.dll",
+  "game": {
+    "exe_timestamps": [
+      "0x6ABEAA3F"
+    ]
+  },
+  "load": {
+    "wait": "window",
+    "delay_ms": 2000
+  },
+  "config": [
+    {
+      "file": "satfix.ini",
+      "default": "defaults/satfix.ini",
+      "title": "satfix"
+    }
+  ],
+  "update": {
+    "github": "Aa728848/satfix",
+    "asset": "satfix-*.zip"
+  },
+  "homepage": "https://github.com/Aa728848/satfix"
+}
