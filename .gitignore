@@ -1,0 +1,38 @@
+# 构建产物（Windows 侧）
+satfix-win/build/
+satfix-win/dist/
+satfix-win/plugin/logs/
+satfix-win/plugin/config/
+satfix-win/plugin/satfix.dll
+
+# Windows 侧测试/插件产物
+*.dll
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+
+# Linux 侧构建产物
+*.so
+*.o
+satfix/test/abi_check
+satfix/test/libmock_stellaris.so
+satfix/test_stl_fix
+
+# 游戏自己的文件（不随仓库分发）
+*.log
+*.sav
+*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器 / 系统
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,35 @@
+# 归一化行尾：避免 Windows 上 clone 出来的 shell 脚本带 CRLF 而在 Linux 上跑不了。
+* text=auto
+
+# shell / python / 构建脚本必须是 LF
+*.sh    text eol=lf
+*.py    text eol=lf
+*.conf  text eol=lf
+*.ini   text eol=lf
+Makefile text eol=lf
+.gitignore text eol=lf
+
+# PowerShell 在 Windows 上跑，用 CRLF 更稳
+*.ps1   text eol=crlf
+
+# 源码：交给 text=auto 判断
+*.c     text
+*.cpp   text
+*.hpp   text
+*.h     text
+*.md    text
+*.txt   text
+*.json  text
+*.yml   text
+*.yaml  text
+*.lua   text
+*.rst   text
+
+# 二进制（正常不该进仓库，保险起见标记出来）
+*.dll   binary
+*.so    binary
+*.exe   binary
+*.obj   binary
+*.lib   binary
+*.pdb   binary
+*.png   binary

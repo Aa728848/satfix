@@ -1,0 +1,370 @@
+=== satfix-win 实机游戏内证据 ===
+
+存档: 地球联合国 / 天龙帝国（后期 mod 存档，游戏时间 2200.04.28）
+      帝国数值极大：海军容量 68000/40000、资源 796M+2G、17 支舰队各 58.2M
+注入方式: stl inject（手动注入到运行中的 stellaris.exe）
+构建: 影子模式（REPLACE=0），8 个目标
+
+--- 安装与自检 ---
+[satfix] exe build 0x6ABEAA3F（期望 0x6ABEAA3F）
+[satfix] 判定逻辑自检：全部通过              （14 组向量表，在游戏进程内跑）
+[satfix] 目标: 签名校验通过 8/8，未定位 16，本构建适配 8
+[satfix] 共装上 8/8 个钩子（跳过 0）  [影子模式]
+
+--- 8 个目标全部确认被真实调用（首次调用心跳）---
+首次调用: GetRounded/GetRounded64
+首次调用: operator fpml::fixed_point<...,15>
+首次调用: ApplyModifierMult(cfx)              <- 主战场，本轮新定位
+首次调用: GetRounded(fp15)
+首次调用: RoundTo
+首次调用: Atan2
+首次调用: multiply_variable
+
+--- 各目标累计调用次数（heartbeat 快照，累计 3.22M 次调用）---
+--- heartbeat: 3220000 次调用，溢出 3 次 ---
+      GetRounded/GetRounded64              27657
+      operator fpml::fixed_point<...,15>   4
+      ApplyModifierMult(cfx)               1440977     <- 高频，确认是数值放大的主出口
+      multiply_variable                    314607      <- 变量系统被大量使用
+      GetRounded(fp15)                     16907
+      RoundTo                              992
+      Atan2                                1418912     <- 出乎意料地高频
+      （ApplyModifierMult(fp15) 未出现在列表 = 0 次，该重载在此存档未被走到）
+
+--- 分歧统计 ---
+正常游玩期间：0 条分歧（EVENT）。
+唯一的 3 条 EVENT 来自探针注入的极值，且都在预期边界上：
+EVENT GetRounded x=9223372036854775807  game=-92233720368547 sat=92233720368547
+EVENT GetRounded x=9223372036854725808  game=-92233720368547 sat=92233720368547
+EVENT GetRounded x=-9223372036854775808 game=92233720368547  sat=-92233720368547
+
+--- 结论 ---
+1. 8 个目标全部装上并被真实游戏代码调用（不是"装了但没进"）。
+2. 即使在这个数值被 mod 放得极大的后期存档里，144 万次 ApplyModifierMult 调用
+   中**没有一次**触发 int64 溢出 —— 与 Linux 侧 README 第 3 节的判断一致：
+   原版量级离阈值极远，溢出需要 mod 把数值推到 ~9.2e17 量级。
+3. 因此"实机 0 条 EVENT"是**预期结果**，而不是"没装上" ——
+   后者由「首次调用」心跳与自检排除。
+
+--- 附：apply_mul_cfx 身份的四重交叉验证 ---
+Linux 侧 78 个函数调用 ApplyModifierMult；把 Windows 侧 FUN_14036df80 的调用者
+按「字符串字面量」认出 Linux 同名函数后，**函数名与调用次数同时吻合**：
+
+  Windows 调用者            识别依据（字符串）                        调用次数
+  FUN_14073c540             STARBASE_CAPACITY_BASE...                 2  == CalcStarbaseCapacity(2)
+  FUN_14072e570             HOSTILE_CLAIMS_PROTECTION...              2  == CalcClaimInfluenceCost(2)
+  FUN_140a42ca0             FEDERATION_ENVOYS...                      1  == BuildEnvoysTooltip(1)
+  FUN_14071fc60             EMPIRE_SIZE_FROM_DISTRICTS...             6  == CalcEmpireSize(8)
+
+四个独立调用者在「名字」和「调用次数」两维同时对上，且 FUN_14036df80 共 41 个调用点
+（Linux 78 个，同一量级）。这是**证明**，不是推测。
+
+============================================================================
+0.2.0（十二目标）实机统计 —— 2026-10-10 14:19
+============================================================================
+一局后期 mod 存档，累计 10.2M 次调用，**0 条真实 EVENT**。
+
+最后一个心跳的逐目标计数：
+      CalcMaxHitPoints                     1375052
+      add_variable                         15029
+[satfix] --- heartbeat: 10300000 次调用，溢出 0 次 ---
+      GetRounded/GetRounded64              171713
+      ApplyModifierMult(cfx)               1706797
+      multiply_variable                    9837
+      GetRounded(fp15)                     6961
+      RoundTo                              5610
+      Atan2                                4165014
+      CalcMaxShieldHitPoints               1406346
+      CalcMaxArmorHitPoints                1406346
+      CalcMaxHitPoints                     1406347
+      add_variable                         15029
+[satfix] --- heartbeat: 10400000 次调用，溢出 0 次 ---
+
+本轮新增的 4 个目标全部确认被真实游戏代码调用：
+  CalcMaxShieldHitPoints / CalcMaxArmorHitPoints / CalcMaxHitPoints  各约 134 万次
+  add_variable                                                        15029 次
+
+「0 条 EVENT」是预期结果：这些量级离 int64 溢出阈值（约 9.2e17）差十几个数量级。
+证明"装上了且被调用"的是上面的计数，不是 EVENT 数。
+
+var_multiply 的 RVA 在本轮从 0x00231640 更正为 0x01777F00（旧值装错了函数，
+详见 README 0.1.3）。更正前后都"被调用"过，但只有更正后才真正作用在变量系统上。
+
+============================================================================
+变量系统升级为真 EXACT —— 2026-10-10 14:36
+============================================================================
+辅助函数 4/4 解析成功（日志：辅助函数: 签名校验通过 4/4（变量系统 EXACT 可用））。
+
+四个 helper 的 RVA 是从已确证的 var_multiply(0x1777F00) 调用点读出来的：
+  AccessVariablePointer   0x9F7DF0
+  CVariables::GetVariable 0x227390
+  CVariables::SetVariable 0x7AAE10
+  GetValue                0x34D500
+关键偏移：条目 +4 = 已设标志（== -1 未设），条目 +0x38 = CFixedPoint 值
+（GetVariable 读 / SetVariable 写 两侧偏移互为印证）。
+
+实机 SAMPLE（证明读回链接在真实游戏状态上，不是读常量槽）：
+  SAMPLE add_variable      v0=0             d=100000 game=100000       sat=100000       一致
+  SAMPLE add_variable      v0=100000        d=100000 game=200000       sat=200000       一致
+  SAMPLE add_variable      v0=200000        d=100000 game=300000       sat=300000       一致
+  SAMPLE multiply_variable v0=7345573000000 d=100000 game=7345573000000 sat=7345573000000 一致
+三次 add 的 v0 依次等于上一次写回值 -> 读回链自洽。游戏全程稳定，0 条分歧。
+
+本轮证伪的三条思路（已写进 README 0.1.5 与目标表）：
+  1. Linux 里的立即数指纹对 MSVC 不可移植
+     （mpe15 的 0x7fffffff8000 / 0xffffffffffff8000 在 Windows 出现 0 次；
+       MSVC 用 SAR + 事后掩码，不写立即数）
+  2. Linux 的成员偏移不能搬到 MSVC
+     （diplo_weight 的 0x808+0xec+0xe0 组合命中 0 个；
+       已知 +0xb8->+0xc0、+0xe8->+0xf0）
+  3. 按 Linux 间距找邻居不可靠（函数体量不同，间距不可移植）
+
+仍差 6 个：cfx_sqrt / cfx_safe_sqrt / cfx_safe_sqrt_int / mpe15 / mpe7 / diplo_weight
+
+============================================================================
+Sqrt 家族确证 + 一次 ABI 踩坑 —— 2026-10-10 14:55
+============================================================================
+新增 2 个目标（14/14 装上，4/4 辅助函数）：
+  cfx_sqrt      0x1B489D0  INPUT_GUARD
+  cfx_safe_sqrt 0x1B4C600  OBSERVE
+
+定位：Linux 里调用 Sqrt 的只有 4 个函数，其中 CalcDistance 同时调 Sqrt 与 SafeSqrt
+且带独特常量 0xf4241(=1000001)。按该常量在 Windows 侧得 3 候选，其一含 CFixedPoint
+专属魔数 0x29f16b11c6d1e109 -> 读体确认是 CalcDistance 同构体 -> 它调的 0x1B489D0
+就是 Sqrt。再由 Sqrt 的调用者顺出 0x1B4C600 = SafeSqrt() const。
+
+**踩的坑**：我把两个都按 (out, src) 写，Sqrt 对、SafeSqrt 反了。
+探针立刻暴露：SafeSqrt 的返回槽一直是预置哨兵 0x5A5A5A5A5A5A5A5A
+(= 6510615555426900570)，五个输入全"返回"同一个数。
+函数体显示 Sqrt 是 *param_1 = result，SafeSqrt 是 *param_2 = result。
+教训：同类相邻成员的参数顺序不一定一致，不能类推。
+
+修正后的探针（ABI 正确的证据）：
+  探针 Sqrt     x=100000 (1.0)      -> 100001   (1.0000)     sqrt(1)=1        OK
+  探针 Sqrt     x=10000000000 (1e5) -> 31622927 (316.2293)   sqrt(1e5)=316.2278  误差 4.6e-6
+  探针 Sqrt     x=1 (1e-5)          -> 0                     走 1<x 守卫      OK
+  探针 Sqrt     x=-1                -> 0                     INPUT_GUARD 触发 OK
+  探针 SafeSqrt x=100000 (1.0)      -> 100001   (1.0000)                     OK
+  探针 SafeSqrt x=10000000000 (1e5) -> 31622790 (316.2279)                误差 4.4e-7
+  探针 SafeSqrt x=1 (1e-5)          -> 317      (0.0032)   sqrt(1e-5)=0.003162 OK
+SafeSqrt 比 Sqrt 更准，正是它"先缩放进安全域再算"的设计目的。
+
+cfx_safe_sqrt_int：Windows 侧**不存在独立符号**（已内联）。
+Sqrt 与 SafeSqrt 的全部调用者都已枚举读体，没有一个是 Linux 那个 10 行包装。
+不是"没找到"而是"不存在"；等价保护已被 Sqrt/SafeSqrt 两个钩子覆盖。
+
+实机：14/14 钩子，8.3M 次调用。
+  Sqrt 3188 次 / SafeSqrt 1722 次 —— 都被真实游戏代码调用。
+  4 条 EVENT 全是探针注入的极值（3 条 GetRounded 边界 + 1 条 Sqrt x=-100），
+  正常游玩 0 条分歧。
+
+============================================================================
+diplo_weight 确证 —— NDefines 名字法（第三个方法突破） 2026-10-10 15:04
+============================================================================
+新增：diplo_weight = CPopJob::CalcDiplomaticWeight @ 0x00838670（OBSERVE）
+15/15 钩子装上，实机 115752 次调用，0 条分歧。
+
+难点：这个函数在 Linux 里**没有任何直接调用者**（只有 4 处提及全是它自己），
+调用者法完全无效；守卫密度筛出 24 候选、结构偏移 +0x808 命中 0 个。
+
+新方法：Paradox 的 NDefines 名字字符串在 exe .rdata 里是明文。
+  1. 找名字 VA（DIPLOMACY_WEIGHT_POP_BASE -> 0x142360e08）
+  2. 扫 .text 找 rip-relative 引用 -> 每个名字只有 1 处
+  3. 反汇编那处 = 5 指令 thunk：mov rcx,rdx / lea r9,[全局] / lea rdx,["NGameplay"] /
+     lea r8,["<名字>"] / jmp <注册函数>
+     -> 名字到全局地址的对应关系被直接读出来：
+        DIPLOMACY_WEIGHT_POP_BASE      -> 0x143151010
+        DIPLOMACY_WEIGHT_POP_HAPPINESS -> 0x143151008
+  4. 找「同时读这两个全局」的函数 -> 110843 个函数块里**命中数 = 1**
+
+体形逐条对上 Linux 1177404-1177484：
+  param_3+8 虚调用 / param_1+0x18 取 CJobType / param_1+0xec 计数 / param_1+0xe0 数组
+  （后两个偏移与 Linux 完全相同）/ (arr)[i*2+1]*100000 / * DAT_143151010/100000 /
+  FUN_14067eec0(= HasHappiness) / * DAT_143151008/100000 / *(param_3+0x8b0) 再乘 / 求和写回 sret
+
+顺带解答上轮疑问：Linux 读 param_10+0x808，Windows 读 param_3+0x8b0 ——
+这就是按 +0x808 检索命中 0 个的原因。MSVC 布局差异再次实证。
+
+可复用：任何 NDefines::<组>::<名字> 静态成员都能用这三步定位，
+读的是编译器自己写的元数据，比函数体指纹可靠。
+
+实机：15/15 钩子，5.8M 次调用，0 条真实 EVENT。
+  CalcDiplomaticWeight 115752 次 —— 用户实测最易溢出的目标已覆盖。
+
+============================================================================
+REPLACE=1 实跑 + 一个真并发 bug —— 2026-10-10 15:11
+============================================================================
+REPLACE=1 构建：15/15 钩子装上（[REPLACE 已开]），实机 3.5M 次调用
+  -> 0 条 EVENT、0 次 replaced、游戏全程稳定。
+  这是预期结果：正常游玩离 int64 溢出阈值差十几个数量级，
+  所以回写路径"被走过 0 次"是正确行为，不是失效 ——
+  回写代码本身的正确性由离线对拍 58/58 + 判定自检 14 组覆盖。
+
+**又抓到一个真 bug（并发写日志）**：
+  症状：日志出现 CalcDiplomaticWeight  50986[satfix] --- heartbeat: ...
+  根因：log_line_raw 早先是三次独立调用
+        fputs("[satfix] ") / fputs(正文) / fputc('\n')，
+        detour 跑在多个游戏线程上，两个线程会**插在中间**。
+        （上一轮我只把"正文拼成一块"，前缀那一步仍是独立调用，所以没修干净。）
+  修法：整行（前缀+正文+换行）先拼进一个缓冲，再**一次** fputs；
+        并加 SRWLOCK 让计数与写入成为临界区（避免两线程同时越过行数上限、
+        或同时用同一个缓冲）。
+  验证：修后实机 0 条畸形行（\d+\[satfix\] 匹配数 = 0），心跳块完整。
+
+当前状态（0.2.0 / REPLACE=1）：
+  15/15 目标 + 4/4 辅助函数
+  未定位 3 个：mpe15、mpe7、cfx_safe_sqrt_int（后者已判定 Windows 侧不存在）
+  可做真替换的：cfx_get_rounded、cfx_to_fp15、apply_mul_cfx、apply_mul_fp15、
+                var_add、var_multiply（6 个 EXACT）
+
+============================================================================
+mpe15 / mpe7 确证 —— 17/17，只剩 1 个未定位 2026-10-10 15:19
+============================================================================
+新增：mpe15 = 0x00A0A4A0（OBSERVE）、mpe7 = 0x00A0A610（OBSERVE）
+17/17 钩子装上，实机 2390 万次调用，0 条真实分歧，游戏稳定。
+
+这两个目标前两轮完全卡住（调用者法无效 / 常量法无效 / 递归判据无效）。
+本轮破局靠**把 NDefines 名字法做成通用工具**：
+
+1. 先写对 thunk 解析器。关键 bug：字符串地址必须经 RVA -> 文件偏移 转换，
+   不能直接用 va-ImageBase（.rdata 的 raw/virtual 对齐不同，差了 0x2000）。
+   用**已独立确证**的 DIPLOMACY_WEIGHT_POP_BASE/HAPPINESS 做校准，
+   解析器给出的 0x143151010 / 0x143151008 与前面两次独立确证**完全一致** -> 解析器可信。
+2. 共提取 **2369 个** (名字, 组, 全局地址) 三元组，含 31 个 MILITARY_POWER*。
+   拿到 MILITARY_POWER_EXPONENT -> 0x1431505B0（组 = NShip）。
+3. 唯一读它的函数 FUN_140a08960 把这个 define 当**指数**传给 FUN_140a0a610 -> 那是幂函数。
+4. FUN_140a0a610 移位是 <<7 / >>7 / 0x80 / 0x7f -> **fp7 编码** -> mpe7。
+   紧邻的 FUN_140a0a4a0 移位是 <<0xf / >>0xf / 0x8000 / 0x7fff -> **fp15** -> mpe15。
+
+编码判定与 Linux 完全吻合：
+  Linux mpe15 掩码 0x7fffffff8000 / 0xffffffffffff8000  (fp15 的 0x7fff/0x8000)
+  Linux mpe7  掩码 0x7fffffff80   / 0xffffffffffffff80  (fp7  的 0x7f/0x80)
+两边都是「处理负指数 -> 调 log2 辅助 -> 累加收敛」，收敛条件同为
+while (sum != next + sum)。各自还有配套的 log2 辅助：
+mpe15 用 FUN_140a0a770（fp15 版）、mpe7 用 FUN_140a0a840（fp7 版），成对。
+
+**ABI 踩坑第 4 次**：Linux 是 (out, 指数, 底数)，Windows 是 (out, 底数, 指数) —— 相反。
+
+实机计数（一局后期 mod 存档）：
+  CalcMilitaryPowerExponent<15>   1625512 次
+  CalcMilitaryPowerExponent<7>    1562356 次
+  两者都被真实战斗代码大量调用，0 条分歧。
+
+累计 2390 万次调用（17 目标），0 条真实 EVENT，0 条畸形日志行。
+
+剩 1 个：cfx_safe_sqrt_int —— 已判定 Windows 侧**不存在**（被完全内联），
+不是"没找到"。等价保护已由 Sqrt（INPUT_GUARD）+ SafeSqrt（OBSERVE）覆盖。
+
+============================================================================
+收尾核查：三个"缺口"的真假 + 回写路径端到端 A/B 证明 2026-10-10 15:26
+============================================================================
+一、逐条核对 Linux 的 24 项与 Windows 的 21 项（Linux 表里第一项 "key" 是宏占位，不是目标）
+    Linux 有、Windows 无：cfx_safe_sqrt_int、cfx_get_rounded64
+
+    (1) cfx_get_rounded64 —— **不是缺口，已覆盖**。
+        实证：把 0x1B4C170 的前 24 字节机器码在整个镜像里做字节搜索，
+        **全镜像只出现 1 次**。说明 MSVC 的 COMDAT 折叠把 GetRounded 与
+        GetRounded64（Linux 是两个独立地址 0x04230860 / 0x042308b0）合并成了一份代码。
+        所以那一个钩子同时覆盖两者 —— 这不是"漏了"，是"本来就只有一份"。
+
+    (2) cfx_safe_sqrt_int —— **不是缺口，Windows 侧不存在该函数**（已完全内联）。
+        Sqrt 与 SafeSqrt 的全部调用者都已枚举读体，没有一个是 Linux 那个 10 行包装。
+        等价保护由 Sqrt(INPUT_GUARD) + SafeSqrt(OBSERVE) 覆盖。
+
+    结论：Linux 的 19 个 hook 目标在 Windows 侧**全部覆盖**。
+
+二、发现并关闭了一个真实的验证缺口：回写路径此前从未端到端验证过
+    此前"REPLACE=1 跑过 350 万次调用不崩"只证明了**不崩**，没证明**真改对了值**。
+    新增探针：传 INT64_MAX 给 GetRounded，看返回值是 game 的 wrap 值还是我们的饱和值。
+    （注：GetRounded 是纯读函数，只读 *param_1、结果放返回值，不写回入参 ——
+      所以判据看返回值。我第一版探针错看成"输出槽"，已修正。）
+
+    A/B 实测（同一构建脚本，只差 -Replace 开关）：
+      REPLACE=0：GetRounded(INT64_MAX) -> 返回 -92233720368547  [game 的 wrap 值]
+      REPLACE=1：GetRounded(INT64_MAX) -> 返回 +92233720368547  [饱和值]
+    这是**端到端**证明：回写路径确实把一个溢出值纠正了。
+
+三、策略分布与 Linux 对齐
+    Linux 侧（sat_guard.cpp 注释）：EXACT 6 组 / INPUT_GUARD 2 组 / OBSERVE 7 组
+    Windows 侧（本构建）      ：EXACT 6 个 / INPUT_GUARD 1 个（Sqrt）/ OBSERVE 10 个
+    EXACT 集合完全相同（cfx_get_rounded、cfx_to_fp15、apply_mul_cfx、apply_mul_fp15、
+    var_add、var_multiply）—— 即"能真正修数值"的那部分能力已对等。
+    其余按 Linux 原设计本就是观测/输入守卫，不是缺失。
+
+四、当前发布物：dist/satfix 为 REPLACE=0（安全默认），17/17 钩子 + 4/4 辅助函数。
+
+============================================================================
+更正：cfx_safe_sqrt_int 是**真缺口**，我之前的说法是错的 2026-10-10 15:30
+============================================================================
+用户问「Linux 能力是否已完全迁移」，我逐条复核时发现自己在 0.1.11 里写错了一句：
+
+  错话：「cfx_safe_sqrt_int 不是缺口，等价保护由 Sqrt(INPUT_GUARD) + SafeSqrt(OBSERVE) 覆盖」
+  事实：SafeSqrt(long long) 的溢出点是 p * 100000（p > 9.22e13），
+        而 Sqrt / SafeSqrt(const&) 的溢出点在**别的算式**上，不是同一个点。
+        装上后者**不能**覆盖前者。已撤回并改写目标表与 README。
+
+为找内联副本做的检索（都失败）：
+  (a) 「含 0x2711 + * 10000 且不调用 0x1B4C600/0x1B489D0」的完整内联体
+      -> 全库命中 1 个，是 libpng 的 gamma 检查，不是它。
+  (b) 「含 * 100000 且调用 0x1B4C600」的 4 个函数
+      (0x26C6A0 / 0x33FD20 / 0xA37200 / 0xBF8600) 逐个读过体，
+      都是各自独立的除法/缩放计算，不是 p*100000 喂给 SafeSqrt 的形态。
+
+另外复核 Linux 侧实际安装的目标数：**19 个**（try_install 出现 19 次），
+与 Windows 的 17 个对照：
+  Linux 有 / Windows 无：cfx_safe_sqrt_int（真缺口）、cfx_get_rounded64（COMDAT 折叠，已覆盖）
+  => Windows 覆盖 18/19，缺 1 个。
+
+策略分布（Linux 注释统计，OBSERVE 覆盖 11 处钩子）：
+  Linux  : EXACT 6 / INPUT_GUARD 2 / OBSERVE 11
+  Windows: EXACT 6 / INPUT_GUARD 1 / OBSERVE 10
+  EXACT 集合完全相同 —— 「能真正修数值」的能力已对等。
+
+诚实结论：**没有完全迁移**。19 个 hook 目标覆盖 18 个，
+唯一缺口是 cfx_safe_sqrt_int 的 INPUT_GUARD（触发阈值 p > 9.22e13，极端 mod 才走到）。
+
+============================================================================
+cfx_safe_sqrt_int 结案：不是缺口，Windows 侧无对应代码 2026-10-10 15:43
+============================================================================
+用户要求"解决它"，结果是把它的性质查清了 —— 它不是待定位，而是**不存在**。
+
+定位过程（用上了之前没用的一条线索：独占报错串）：
+  Linux 侧 SafeSqrt(long long) 的**唯一**真实调用点是 MTTHModifyNumber 的 case 0xf
+  （脚本 sqrt 运算符），该分支前有独占串
+  "script_value/MTTH/weight field: Cannot square root a number that is negative at %s"。
+  按该串在 Windows dump 检索 -> **唯一命中 FUN_14033fd20**（= Windows 的 MTTHModifyNumber，
+  176 行 switch，每个 case 对应一种脚本运算：case 0xc 取绝对值 / 0xe pow / 0xf sqrt）。
+
+读它的 case 0xf：
+    case 0xf:
+      if (-1 < (longlong)*param_1) {                   // 非负才走
+          puVar4 = FUN_141b4c600(param_1, &local_20);  // = SafeSqrt(CFixedPoint const&)
+          *param_1 = *puVar4;
+          return 1;
+      }
+      ... "Cannot square root a number that is negative at %s"   // 负值 -> 报错，不算
+
+**它直接把 param_1（CFixedPoint*）的地址传给引用版 SafeSqrt，没有 p*100000 这一步。**
+
+对照：
+  Linux   : SafeSqrt(param_9)          实参是**整数** long  -> 重载内部做 p*100000（溢出点）
+  Windows : FUN_141b4c600(param_1, ...) 实参是**指针**      -> 无该步
+
+case 0xf 里 param_1 本来就是定点格式、值已在格式内，所以编译器直接用引用重载，
+不需要「整数 -> 定点」换算 —— 那个 p*100000 压根不生成。
+**Linux 那条 INPUT_GUARD 保护的是一步 Windows 编译器根本不会生成的运算。**
+
+而且 case 0xf 自己已有负值检查（负 -> 报错返回，不计算），
+即 Linux 守卫要防的场景，游戏在本路径上已自行防护。
+真正的 sqrt 求值路径已被 cfx_safe_sqrt 钩子覆盖（含 x<0 判定）。
+
+为找内联副本做的检索（都失败，留档）：
+  (a) 精确签名「0x2710 + 0xb504f333 + 0x16a09e666 三件套」全库仅 1 处（真函数本身）；
+  (b) SafeSqrt 的 6 个调用点逐个反汇编，无一是 p*100000 形态；
+  (c) 80 字节窗口搜出的 3 个"疑似内联点"经读体确认是 x*x 乘法辅助（假阳性）。
+
+**最终结论：Linux 的 19 个 hook 目标在 Windows 侧全部覆盖。**
+  - cfx_get_rounded64：COMDAT 折叠，与 cfx_get_rounded 同地址，一个钩子覆盖两者
+  - cfx_safe_sqrt_int：Windows 侧无对应代码（MSVC 不生成该重载的那步换算）
+
+构建门禁：25/25 + 58/58 + 14组 + 24/24 全绿，17/17 目标 + 4/4 辅助函数。

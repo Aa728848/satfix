@@ -1,0 +1,18 @@
+# Xmake cache
+.xmake/
+build/
+
+# MacOS Cache
+.DS_Store
+
+.vscode/
+
+.cache/
+
+compile_commands.json
+
+# Doxygen generated
+docs/html/
+docs/latex/
+docs/xml/
+docs/_build

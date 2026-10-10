@@ -1,0 +1,19 @@
+# 本地配置：不同机器路径不同，不要提交
+satfix.conf
+
+# 构建产物
+*.o
+*.so
+/test_stl_fix
+
+# 自动生成的地址表：建议提交（记录了目标 build 的地址，便于 --check 发现漂移）
+# 如果不想提交，把下面一行取消注释
+# satfix_targets.generated.hpp
+
+# Python 缓存
+tools/__pycache__/
+__pycache__/
+
+# 测试产物
+test/abi_check
+test/libmock_stellaris.so
