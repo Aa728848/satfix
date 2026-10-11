@@ -1040,13 +1040,42 @@ struct MaxHpRecipe {
     /// `add_in == 0` 是异常（值本该在这）；对船体，它是**正常状态**，
     /// 拿它当判据会误伤。所以按目标分别开关。
     bool    add_carries_value;
+    /// 按舰船等级索引的额外乘算修正表（VA 的低 32 位；0 = 不建模）。
+    uint32_t class_table_rva;
 };
 
-constexpr MaxHpRecipe kRecipeShield = {0x130, 0x2e, 0x2f, 0x1c8, 0x1c9, true};
-constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x24, 0x25, 0x1c6, 0x1c7, true};
+/// 上限函数体内那张**按舰船等级**索引的修正类型表（VA 的低 32 位）。
+///
+/// 三个函数里都有这一段（形状相同，只有表地址不同）：
+///     bVar1  = *(byte *)(design + 0x468);              // 舰船等级下标
+///     tbl    = &DAT_1428xxxx + bVar1 * 4;              // 该等级的 ModifierType
+///     for (i = 0; i < *(int *)(mods + 0x1c); ++i)
+///         if (*(int *)(*(long long *)(mods + 0x10) + i*4) == *tbl) {
+///             v = *(long long *)(i*0x10 + *(long long *)(mods + 0x38));
+///             if (掩码 bit5) { if (v < 0) v = 0; if (v > 1.0) v = 1.0; }
+///             add += v;                                 // ★ 加到 **add_mul**
+///             break;
+///         }
+///
+/// **为什么必须建模**：漏掉它时重算会系统性偏小。实测一例
+/// （日志 NOTE 行）：游戏=21304430712 而我们重算=1782290712 —— 差 13 倍，
+/// 正是这一项没算。这就是船体此前一直「重算≠游戏」的原因。
+///
+/// **与 modifier_value 的区别**：这里是**内联**展开，结尾**不做**
+/// `FUN_140d2c080(size, type)` 那一项相加（那一步只出现在 FUN_140d29dd0 里）。
+/// 所以不能直接复用 modifier_value，必须自己扫表。
+constexpr uint32_t kClassTableShield = 0x28167acu;
+constexpr uint32_t kClassTableArmor  = 0x2816774u;
+constexpr uint32_t kClassTableHull   = 0x281673cu;
+/// 舰船等级下标在 design 里的偏移（三个函数都用 0x468）。
+constexpr int64_t kShipClassOff = 0x468;
+
+constexpr MaxHpRecipe kRecipeShield = {0x130, 0x2e, 0x2f, 0x1c8, 0x1c9, true,
+                                       kClassTableShield};
+constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x24, 0x25, 0x1c6, 0x1c7, true, kClassTableArmor};
 // 船体：add_carries_value = false —— 它的 add_in 正常就是 0，不能当溢出判据。
 // 它的溢出走另一条路（base 非 0，乘爆后 wrap），由下面的 `v < 0` 那条分支兜。
-constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x1e, 0x1f, 0, 0, false};
+constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x1e, 0x1f, 0, 0, false, kClassTableHull};
 
 /// 用游戏自己的原语饱和重算上限。成功返回 true 并把结果写进 `*out`。
 /// 任一原语没解析到（辅助函数签名校验失败）就返回 false，调用方退化成「只认负数」。
@@ -1100,12 +1129,79 @@ inline bool is_hp_modifier_type(int t) {
     }
 }
 
+/// 上限函数体内那张**按舰船等级**索引的修正类型表。
+///
+/// 三个函数里都有这一段（形状相同，只有表地址不同）：
+///     bVar1  = *(byte *)(design + 0x468);              // 舰船等级下标
+///     tbl    = &DAT_1428xxxx + bVar1 * 4;              // 该等级的 ModifierType
+///     for (i = 0; i < *(int *)(mods + 0x1c); ++i)
+///         if (*(int *)(*(long long *)(mods + 0x10) + i*4) == *tbl) {
+///             v = *(long long *)(i*0x10 + *(long long *)(mods + 0x38));
+///             if (掩码 bit5) { if (v < 0) v = 0; if (v > 1.0) v = 1.0; }
+///             add += v;                                 // ★ 加到 **add_mul**
+///             break;
+///         }
+///
+/// **为什么必须建模**：漏掉它时重算会系统性偏小。实测一例
+/// （日志 NOTE 行）：游戏=21304430712 而我们重算=1782290712 —— 差 13 倍，
+/// 正是这一项没算。
+///
+/// **与 modifier_value 的区别**：这里是**内联**展开，结尾**不做**
+/// `FUN_140d2c080(size, type)` 那一项相加（那一步只出现在 FUN_140d29dd0 里）。
+/// 所以不能直接复用 modifier_value，必须自己扫表。
+///
+/// 内联版「按类型取值」：扫 mods 的 type 数组，命中就取对应值并按掩码夹取。
+/// 不做 FUN_140d2c080 的相加（与游戏内联形态一致）。
+int64_t inline_mod_lookup(const void* mods, int type) {
+    if (mods == nullptr) return 0;
+    const char* m = static_cast<const char*>(mods);
+    int32_t n = 0;
+    const void* types = nullptr;
+    const void* vals = nullptr;
+    if (!whk::safe_read(&n, m + 0x1c, sizeof n) || n <= 0) return 0;
+    if (!whk::safe_read(&types, m + 0x10, sizeof types) || types == nullptr) return 0;
+    if (!whk::safe_read(&vals, m + 0x38, sizeof vals) || vals == nullptr) return 0;
+    for (int32_t i = 0; i < n; ++i) {
+        int32_t t = 0;
+        if (!whk::safe_read(&t, static_cast<const char*>(types) + (size_t)i * 4, sizeof t)) return 0;
+        if (t != type) continue;
+        int64_t v = 0;
+        if (!whk::safe_read(&v, static_cast<const char*>(vals) + (size_t)i * 0x10, sizeof v)) return 0;
+        void* tbl = whk::image_base_plus(0x2814390u);  // ModifierType 元数据表
+        if (tbl != nullptr) {
+            uint32_t mask = 0;
+            if (whk::safe_read(&mask, static_cast<const char*>(tbl) + (size_t)type * 0xb0 + 0xa8,
+                               sizeof mask) &&
+                ((mask >> 5) & 1u)) {
+                if (v < 0) return 0;
+                if (v > cfx::kOne) return cfx::kOne;
+            }
+        }
+        return v;
+    }
+    return 0;
+}
+
+/// 按舰船等级查那个额外的乘算修正（见 kClassTable* 的说明）。
+int64_t ship_class_mod(const void* design, const void* mods, uint32_t table_rva) {
+    if (design == nullptr || table_rva == 0) return 0;
+    uint8_t cls = 0;
+    if (!whk::safe_read(&cls, static_cast<const char*>(design) + kShipClassOff, sizeof cls)) return 0;
+    const void* table = whk::image_base_plus(table_rva);
+    if (table == nullptr) return 0;
+    int32_t type = 0;
+    if (!whk::safe_read(&type, static_cast<const char*>(table) + (size_t)cls * 4, sizeof type))
+        return 0;
+    return inline_mod_lookup(mods, type);
+}
+
 /// 重算的中间量，用于诊断「为什么没报」。
 /// stage: 0=未开始 1=helper 缺失 2=size 为空 3=读 base 失败 4=modifier 返回空
 ///        5=完成 6=factor<=0（真值为负，按 Linux 同款跳过）
 struct MaxHpDetail {
     int     stage = 0;
     int64_t base_raw = 0, add_in = 0, add_mul = 0, cls_base = 0, cls_mul = 0;
+    int64_t cls_tbl = 0;
     int64_t factor = 0, sat = 0;
 };
 
@@ -1166,6 +1262,14 @@ bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods
             if (d) d->cls_mul = c;
             add = add_sat(add, c);
         }
+    }
+
+    // 按舰船等级的额外乘算修正（内联形态，见 kClassTable* 的说明）。
+    // 漏掉它会让重算系统性偏小 —— 这正是船体此前一直「重算≠游戏」的原因。
+    if (r.class_table_rva != 0) {
+        const int64_t cm = ship_class_mod(design, mods, r.class_table_rva);
+        if (d) d->cls_tbl = cm;
+        add = add_sat(add, cm);
     }
 
     const int64_t factor = add_sat(add, cfx::kOne);
@@ -1241,11 +1345,11 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
             char mbuf[1400];
             dump_mods(mods, mbuf, sizeof mbuf);
             logf("DIAG %s 游戏=%lld design=%p stage=%d base=%lld add_in=%lld "
-                 "add_mul=%lld cls_b=%lld cls_m=%lld factor=%lld sat=%lld%s",
+                 "add_mul=%lld cls_b=%lld cls_m=%lld cls_tbl=%lld factor=%lld sat=%lld%s",
                  name, (long long)v, const_cast<void*>(design), d.stage,
                  (long long)d.base_raw, (long long)d.add_in, (long long)d.add_mul,
-                 (long long)d.cls_base, (long long)d.cls_mul, (long long)d.factor, (long long)d.sat,
-                 mbuf);
+                 (long long)d.cls_base, (long long)d.cls_mul, (long long)d.cls_tbl,
+                 (long long)d.factor, (long long)d.sat, mbuf);
         }
     }
 
