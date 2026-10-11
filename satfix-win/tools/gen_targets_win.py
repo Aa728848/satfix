@@ -413,27 +413,29 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "damage_per_day",
         "NShipUtil::CalcAverageDamagePerDay(CBaseDesignImplementation const&, ...) "
         "—— 设计师面板的「伤害」",
-        0x003C2910,
+        0x00A14C60,
         "OBSERVE",
-        "**对照 Linux 符号名定出来的（用户建议「对照 linux 版本的代码库」，一次命中）。**"
-        "Linux 侧这个函数叫 `NShipUtil::CalcAverageDamagePerDay`（868 行），"
-        "体内有一个**独占的安全界常量 `0xb50679d3`**（不是常见的 0xb504f333）—— "
-        "它出现在末尾那次「乘以 (add+1.0)」的快速路径判定里："
-        "`if (x + 0xb50679d3 < 0x16a09e667) ...`。"
-        "在 Windows dump 里搜该常量只得到 3 个候选，其中 FUN_1403c2910 是 851 行"
-        "（Linux 868 行，量级吻合），且体内**恰好也只有 1 处** 0xb50679d3（末尾）。"
-        "**逐条对上 Linux**："
-        "末尾算式 Linux `local_b8 = (local_b8 * (local_60+100000)) / 100000`"
-        "对应 Windows `lVar9 = (lVar9 * lVar22) / 100000`（L700，同一位置）；"
-        "拆分回退分支 `(X%1e5)*Y/1e5 + (X/1e5)*Y` 两边逐字一致；"
-        "GetModifierValue 的调用点两边都用 `CShipSize::GetModifierValue`，"
-        "且 Windows 侧传的 type 0x41/0x168/0x230 与 Linux 的 0x41/0x168/0x230 **同号**。"
-        "**溢出点**：L699-710 那次乘法是**裸 64 位乘**，没有饱和 —— 伤害被 mod 堆大后在这里 wrap。"
-        "**为什么是 OBSERVE**：它的 ABI 与 Linux 不同 —— Linux 版 `return local_b8`（值在 rax），"
-        "Windows 版是 `void fn(obj, int idx, longlong* out, param_4)`（唯一调用者 "
-        "FUN_140c9e3f0 的 L142-143 确证），结果写进 out 结构的 `+0x98`。"
-        "要回写就得先逆清那个 out 结构的语义，风险高于收益，所以先观测。"
-        "判据：伤害不可能为负，出现负数或量级离谱（> 9.2e13 游戏单位）就是 wrap。",
+        "**先错了一次，这里是改正后的结论。**"
+        "第一版按独占常量 0xb50679d3 在**全库**搜，得到 3 个候选，我挑了行数最接近的 "
+        "FUN_1403c2910（851 行）—— 那是**错的**：实测打开舰船面板时它算出来的是"
+        "「单件武器」的倍率（obj+0x98 = 24.5 / 19.5 这类小值），"
+        "而且面板那个 -4380077663777.92 从来不出现在它里面。"
+        "**改正方法（更硬的判据）**：三个上限函数（hull 0xA112A0 / shield 0xA11D80 / "
+        "armor 0xA12910）都在 NShipUtil 片区，所以伤害也该在附近。"
+        "扫 0xA00000..0xA20000 这 218 个函数，只看「有定点乘法或调 d29f10/d29dd0」的，"
+        "得到 0xA14C60（614 行）—— 它紧跟 CalcMaxSpeed(0xA14150) 之后。"
+        "**决定性证据：ModifierType 序列逐个相同**。"
+        "Linux CalcAverageDamagePerDay 依次调 GetModifierValue 的 type 是 "
+        "0x3a / 0x40 / 0x168 / 0x41 / 0x1d2 / 0x1d3 / 0x230（7 个）；"
+        "Windows FUN_140a14c60 是 **完全相同的 7 个、相同顺序**。"
+        "（对照：先前那个错的 FUN_1403c2910 只用了 0x41/0x168/0x230 三个。）"
+        "**溢出点**：L594-596 那次 `lVar8 = (plVar10 * plVar13) / 100000` 是裸 64 位乘，"
+        "没有饱和 —— 面板「总计 × 射速倍率」在这里 wrap。"
+        "用户实测：总计 15467.84 × 射速 +1000000000000%（= 1e10 倍）"
+        "= 1.55e14 游戏单位 = 1.55e19 存储值 > INT64_MAX(9.22e18) -> 负值。"
+        "**为什么是 OBSERVE**：ABI 是 sret（`longlong* fn(...)` 返回 param_1），"
+        "但输出结构里哪个字段是面板那个「伤害」还没确证，硬回写有写坏别的统计项的风险。"
+        "判据：伤害不可能为负，负值或 > 9.2e13 游戏单位就是 wrap。",
     ),
 ]
 

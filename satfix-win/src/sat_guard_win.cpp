@@ -963,80 +963,66 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
 
 //  17) NShipUtil::CalcAverageDamagePerDay —— 设计师面板的「伤害」
 //
-//  ABI（由唯一调用者 FUN_140c9e3f0 的 L142-143 确证，**不是 sret**）：
-//      void fn(void* obj /*rcx*/, int idx /*edx*/, long long* out /*r8*/, void* param_4 /*r9*/)
-//  它**没有返回值** —— 结果写进 out 结构。这是与 Linux 版最大的差异：
-//  Linux 的同一个函数 `return local_b8`（值在 rax），Windows 版改成写 out。
+//  **这里踩过一次坑，记录清楚**：
+//  第一版按独占常量 0xb50679d3 全库搜，挑了行数最接近的 FUN_1403c2910（851 行）。
+//  那是错的 —— 它算的是「单件武器」的倍率（obj+0x98 读到 24.5 这类小值），
+//  面板那个 -4380077663777.92 从不出现在它里面。
 //
-//  体内末尾（L699-710）就是溢出点：
-//      lVar9 = local_128 + 100000;                    // factor = add + 1.0
-//      if (lVar22 + 0xb504f333U < 0x16a09e667 && local_128 + 0xb50679d3U < 0x16a09e667)
-//          lVar9 = (lVar9 * lVar22) / 100000;         // ★ 裸 64 位乘，会 wrap
-//      else { ...拆分回退... }
+//  正确目标 FUN_140a14c60（614 行），判据是**ModifierType 序列逐个相同**：
+//    Linux CalcAverageDamagePerDay: 0x3a/0x40/0x168/0x41/0x1d2/0x1d3/0x230
+//    Windows FUN_140a14c60:        0x3a/0x40/0x168/0x41/0x1d2/0x1d3/0x230  ← 全同、同序
+//  （错的那个只用了其中 3 个。）另外它紧跟 CalcMaxSpeed(0xA14150)，
+//  与三个上限函数同属 NShipUtil 片区 —— 位置也对。
 //
-//  OBSERVE：只观测不替换。原因是它的输出结构语义还没逆清 —— 硬回写有写坏
-//  其它字段的风险（一个结构里可能有多个统计值）。判据很硬：**伤害不可能为负**，
-//  所以负值或超过 int64 上界（9.2e13 游戏单位）就几乎必然是 wrap。
+//  ABI（由函数体确证）：sret
+//      long long* fn(long long* ret /*rcx*/, const void* design /*rdx*/,
+//                    const void* mods /*r8*/, const void* fleet /*r9*/,
+//                    char /*栈*/, void* /*栈*/)
+//  体内 `*param_1 = ...` 并 `return param_1`，与三个上限函数同形。
 //
-//  ⚠️ 结构偏移 `+0x98` 是**反编译读出来的**，不是从符号推的，所以打日志时
-//  也把它带出来，方便以后要升级成 EXACT 时核对。
+//  溢出点：L594-596 `lVar8 = (plVar10 * plVar13) / 100000` 是裸 64 位乘。
+//  实测（用户截图）：总计 15467.84 × 射速 +1000000000000%（1e10 倍）
+//      = 1.55e14 游戏单位 = 1.55e19 存储值 > INT64_MAX(9.22e18) -> wrap 成负数。
+//  用户确认：「去掉射速的 buff 肯定就正常了」。
+//
+//  OBSERVE：只观测不替换 —— 输出结构里哪个字段是面板那个「伤害」尚未确证，
+//  硬回写有写坏别的统计项的风险。判据很硬：**伤害不可能为负**。
 constexpr long long kDamageSane = 9223372036854775807LL / 100000;  // 9.2e13 游戏单位
-/// 伤害结果在**第 1 个参数那个对象**里的偏移。
-///
-/// ⚠️ 踩坑记录：函数体里写的是 `*(longlong *)(param_1 + 0x98) = lVar9`
-/// （L844，另有 L783/L792 两处同址写入），param_1 就是 rcx 传进来的那个对象 ——
-/// **不是**第 3 个参数。我第一版按「out 参数」读 `*out`，结果钩子装了、
-/// 被调用 13128 次却一条 EVENT 都没有，因为那个位置根本没有伤害值。
-constexpr int64_t kDamageOutOff = 0x98;
 
-using FnDamagePerDay = void (*)(void* obj, int idx, long long* out, void* param_4);
+using FnDamagePerDay = long long* (*)(long long* ret, const void* design, const void* mods,
+                                      const void* fleet, char a5, void* a6);
 whk::TypedHook<FnDamagePerDay> g_hook_damage;
 
-void detour_damage_per_day(void* obj, int idx, long long* out, void* param_4) {
+long long* detour_damage_per_day(long long* ret, const void* design, const void* mods,
+                                 const void* fleet, char a5, void* a6) {
     const int k = kIdxDamagePerDay;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[k].fetch_add(1, std::memory_order_relaxed);
     note_first_call(k);
     game_thread_pump();
 
-    g_hook_damage.call(obj, idx, out, param_4);
+    long long* const r = g_hook_damage.call(ret, design, mods, fleet, a5, a6);
 
-    // 诊断：把**多个候选位置**一次全打出来，用来定位伤害值到底写在哪。
-    //   背景：面板「伤害」显示 -4380077663777.92（溢出），而 obj+0x98 读到 0 或 24.5
-    //   这类小值 —— 值不在我以为的位置。函数体里出现过三个候选：
-    //   param_1+0x38 / param_1+0x98 / 第 3 参数那块缓冲。与其继续猜，一次全读出来。
+    if (r == nullptr) {
+        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+        return r;
+    }
+    long long v = 0;
+    if (!whk::fast_read(&v, r, sizeof v)) {
+        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+        return r;
+    }
+    // 诊断：前几次 + 大值/负值都打出来（用独立计数器，别复用同一个 —— 踩过坑）。
     if (g_settings.diag_recompute_calls > 0) {
         static std::atomic<int> shown_first{0};
         static std::atomic<int> shown_big{0};
-        long long a = 0, b = 0, c0 = 0, c1 = 0, d = 0;
-        if (obj != nullptr) {
-            whk::fast_read(&a, static_cast<const char*>(obj) + 0x38, sizeof a);
-            whk::fast_read(&b, static_cast<const char*>(obj) + 0x98, sizeof b);
-        }
-        if (out != nullptr) {
-            const char* op = reinterpret_cast<const char*>(out);
-            whk::fast_read(&c0, op, sizeof c0);
-            whk::fast_read(&c1, op + 8, sizeof c1);
-            whk::fast_read(&d, op + 0x98, sizeof d);
-        }
         constexpr long long kBig = 1000000000000LL;  // > 1000 万游戏单位
-        const bool big = (a > kBig || a < -kBig || b > kBig || b < -kBig || c0 > kBig ||
-                          c0 < -kBig || c1 > kBig || c1 < -kBig || d > kBig || d < -kBig);
-        const bool first = shown_first.fetch_add(1, std::memory_order_relaxed) < 4;
+        const bool big = (v > kBig) || (v < -kBig);
+        const bool first = shown_first.fetch_add(1, std::memory_order_relaxed) < 6;
         const bool show_big = big && shown_big.fetch_add(1, std::memory_order_relaxed) < 24;
         if (first || show_big)
-            logf("DIAG dmg obj=%p obj+38=%lld obj+98=%lld out0=%lld out8=%lld out98=%lld%s", obj,
-                 a, b, c0, c1, d, big ? "  <<有大值" : "");
-    }
-
-    if (obj == nullptr) {
-        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
-        return;
-    }
-    long long v = 0;
-    if (!whk::fast_read(&v, static_cast<const char*>(obj) + kDamageOutOff, sizeof v)) {
-        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
-        return;
+            logf("DIAG dmg ret=%p *ret=%lld (%.4f)%s", r, v, static_cast<double>(v) / 1e5,
+                 big ? "  <<大值/负值" : "");
     }
     if (v < 0 || v > kDamageSane) {
         g_events.fetch_add(1, std::memory_order_relaxed);
@@ -1045,6 +1031,7 @@ void detour_damage_per_day(void* obj, int idx, long long* out, void* param_4) {
                  v, static_cast<double>(v) / 1e5, (long long)kDamageSane);
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+    return r;
 }
 //
 //  ABI（三个函数同形，均由函数体确证）：
