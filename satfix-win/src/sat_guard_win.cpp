@@ -981,6 +981,13 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
 //  ⚠️ 结构偏移 `+0x98` 是**反编译读出来的**，不是从符号推的，所以打日志时
 //  也把它带出来，方便以后要升级成 EXACT 时核对。
 constexpr long long kDamageSane = 9223372036854775807LL / 100000;  // 9.2e13 游戏单位
+/// 伤害结果在**第 1 个参数那个对象**里的偏移。
+///
+/// ⚠️ 踩坑记录：函数体里写的是 `*(longlong *)(param_1 + 0x98) = lVar9`
+/// （L844，另有 L783/L792 两处同址写入），param_1 就是 rcx 传进来的那个对象 ——
+/// **不是**第 3 个参数。我第一版按「out 参数」读 `*out`，结果钩子装了、
+/// 被调用 13128 次却一条 EVENT 都没有，因为那个位置根本没有伤害值。
+constexpr int64_t kDamageOutOff = 0x98;
 
 using FnDamagePerDay = void (*)(void* obj, int idx, long long* out, void* param_4);
 whk::TypedHook<FnDamagePerDay> g_hook_damage;
@@ -994,12 +1001,40 @@ void detour_damage_per_day(void* obj, int idx, long long* out, void* param_4) {
 
     g_hook_damage.call(obj, idx, out, param_4);
 
-    if (out == nullptr) {
+    // 诊断：把**多个候选位置**一次全打出来，用来定位伤害值到底写在哪。
+    //   背景：面板「伤害」显示 -4380077663777.92（溢出），而 obj+0x98 读到 0 或 24.5
+    //   这类小值 —— 值不在我以为的位置。函数体里出现过三个候选：
+    //   param_1+0x38 / param_1+0x98 / 第 3 参数那块缓冲。与其继续猜，一次全读出来。
+    if (g_settings.diag_recompute_calls > 0) {
+        static std::atomic<int> shown_first{0};
+        static std::atomic<int> shown_big{0};
+        long long a = 0, b = 0, c0 = 0, c1 = 0, d = 0;
+        if (obj != nullptr) {
+            whk::fast_read(&a, static_cast<const char*>(obj) + 0x38, sizeof a);
+            whk::fast_read(&b, static_cast<const char*>(obj) + 0x98, sizeof b);
+        }
+        if (out != nullptr) {
+            const char* op = reinterpret_cast<const char*>(out);
+            whk::fast_read(&c0, op, sizeof c0);
+            whk::fast_read(&c1, op + 8, sizeof c1);
+            whk::fast_read(&d, op + 0x98, sizeof d);
+        }
+        constexpr long long kBig = 1000000000000LL;  // > 1000 万游戏单位
+        const bool big = (a > kBig || a < -kBig || b > kBig || b < -kBig || c0 > kBig ||
+                          c0 < -kBig || c1 > kBig || c1 < -kBig || d > kBig || d < -kBig);
+        const bool first = shown_first.fetch_add(1, std::memory_order_relaxed) < 4;
+        const bool show_big = big && shown_big.fetch_add(1, std::memory_order_relaxed) < 24;
+        if (first || show_big)
+            logf("DIAG dmg obj=%p obj+38=%lld obj+98=%lld out0=%lld out8=%lld out98=%lld%s", obj,
+                 a, b, c0, c1, d, big ? "  <<有大值" : "");
+    }
+
+    if (obj == nullptr) {
         maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
         return;
     }
     long long v = 0;
-    if (!whk::fast_read(&v, out, sizeof v)) {
+    if (!whk::fast_read(&v, static_cast<const char*>(obj) + kDamageOutOff, sizeof v)) {
         maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
         return;
     }
