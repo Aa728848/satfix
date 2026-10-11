@@ -988,6 +988,8 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
 //  OBSERVE：只观测不替换 —— 输出结构里哪个字段是面板那个「伤害」尚未确证，
 //  硬回写有写坏别的统计项的风险。判据很硬：**伤害不可能为负**。
 constexpr long long kDamageSane = 9223372036854775807LL / 100000;  // 9.2e13 游戏单位
+/// 伤害溢出的封顶值 = int64 上界（即「92 万亿游戏单位」那个天花板）。
+constexpr long long kDamageSaturate = 9223372036854775807LL;
 
 using FnDamagePerDay = long long* (*)(long long* ret, const void* design, const void* mods,
                                       const void* fleet, char a5, void* a6);
@@ -1024,11 +1026,32 @@ long long* detour_damage_per_day(long long* ret, const void* design, const void*
             logf("DIAG dmg ret=%p *ret=%lld (%.4f)%s", r, v, static_cast<double>(v) / 1e5,
                  big ? "  <<大值/负值" : "");
     }
+    // ★ 回写：把 wrap 出来的伤害改成饱和值（INT64_MAX，即那个「92 万亿」上限）。
+    //
+    // 为什么可以直接写 `*r`：`r` 就是函数的 sret 返回槽（`return param_1`），
+    // 它是**专门用来放返回值**的，不是共享结构里的某个字段 —— 写它不会碰到别的统计项。
+    // 这也是为什么这里能比三个上限函数更激进：那三个要重算比对（因为拿不准有没有溢出），
+    // 而这里判据本身就很硬 —— 伤害是「总计 × 倍率」，**不可能为负**，
+    // 出现负值或超过 int64 上界（9.2e13 游戏单位）就必然是 wrap。
+    //
+    // 实测现场（同一函数连续三次调用）：
+    //     *ret = 2078190048            (20781.90)            <- 正常
+    //     *ret = 1915870600908122664   (19158706009081.23)   <- wrap，本分支命中
     if (v < 0 || v > kDamageSane) {
         g_events.fetch_add(1, std::memory_order_relaxed);
         if (g_settings.verbose_events)
-            logf("EVENT CalcAverageDamagePerDay 伤害=%lld (%.4f) —— 应为非负且 <= %lld，疑似 wrap",
-                 v, static_cast<double>(v) / 1e5, (long long)kDamageSane);
+            logf("EVENT CalcAverageDamagePerDay 伤害溢出=%lld (%.4f) -> 封顶到 %lld%s", v,
+                 static_cast<double>(v) / 1e5, (long long)kDamageSaturate,
+#if SATFIX_REPLACE
+                 " [已回写]"
+#else
+                 " [影子模式，未改数值]"
+#endif
+            );
+#if SATFIX_REPLACE
+        g_replaced.fetch_add(1, std::memory_order_relaxed);
+        *r = kDamageSaturate;
+#endif
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
     return r;
