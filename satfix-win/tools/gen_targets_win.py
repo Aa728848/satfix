@@ -236,7 +236,7 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "NShipUtil::CalcMaxShieldHitPoints(CBaseDesignImplementation const&, CModifier const&, "
         "CFleet const*, CToolTip*)",
         0x00A11D80,
-        STRAT_OBSERVE,
+        STRAT_EXACT,
         "**按「CShipSize 修正类型表偏移」确证，两条独立签名同时命中。**"
         "签名一（表偏移）：Linux 版体内有 6 个该表的索引常量 "
         "0x1614c/0x16158/0x161fc/0x16208/0x162ac/0x162b8（= ModifierType 枚举值，"
@@ -256,7 +256,7 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "NShipUtil::CalcMaxArmorHitPoints(CBaseDesignImplementation const&, CModifier const&, "
         "CFleet const*, CToolTip*)",
         0x00A12910,
-        STRAT_OBSERVE,
+        STRAT_EXACT,
         "**本目标的确证强度最高：常量三元组在 110843 个函数块里唯一。**"
         "Linux 版体内有装甲专用的表索引常量 0x15fec/0x15ff8/0x160a8；"
         "把这三个常量同时作为检索条件扫过全部函数块，**命中数 = 1**，就是 FUN_140a12910。"
@@ -272,7 +272,7 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "NShipUtil::CalcMaxHitPoints(CBaseDesignImplementation const&, CModifier const&, "
         "CFleet const*, CToolTip*)",
         0x00A112A0,
-        STRAT_OBSERVE,
+        STRAT_EXACT,
         "**按「CShipSize 修正类型表偏移」确证。**签名一（表偏移）：Linux 版体内有船体专用的 "
         "索引常量 0x13b7c/0x13b88/0x13c2c/0x13c38/0x1538c/0x15398/0x1543c/0x15448，"
         "逐个检索后 0x13b7c/0x13b88/0x13c38/0x15398/0x15448 **只出现在 FUN_140a112a0**"
