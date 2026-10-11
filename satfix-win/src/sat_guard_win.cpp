@@ -207,6 +207,12 @@ struct Settings {
     /// 头 N 次上限调用打印重算链每一段的中间量（默认 12，0 = 关）。
     /// 「溢出没被抓到」时用它定位卡在哪一段。
     int      diag_recompute_calls = 12;
+    /// 把流经 ApplyModifierMult 的护盾/装甲/船体族修正打出来（默认 40 条，0 = 关）。
+    /// 用来追「护盾加算被写成 0」这类上游污染。
+    int      diag_modifier_calls = 40;
+    /// 「加算溢出塌成 0」事件最多写多少行（每条 design 只写一次，见 detour_max_hp）。
+    /// 舰船详情面板每帧重算，不限流会一次刷满日志。
+    int      collapse_log_limit = 64;
 };
 
 std::wstring config_path() { return plugin_dir() + L"config\\satfix.ini"; }
@@ -254,6 +260,10 @@ Settings read_settings(bool* found) {
         else if (key == "log_recompute_mismatch") s.log_recompute_mismatch = is_true(val);
         else if (key == "diag_recompute_calls")
             s.diag_recompute_calls = (int)_strtoi64(val.c_str(), nullptr, 10);
+        else if (key == "diag_modifier_calls")
+            s.diag_modifier_calls = (int)_strtoi64(val.c_str(), nullptr, 10);
+        else if (key == "collapse_log_limit")
+            s.collapse_log_limit = (int)_strtoi64(val.c_str(), nullptr, 10);
         else if (key == "max_hp_cap") {
             const long long v = _strtoi64(val.c_str(), nullptr, 10);
             if (v > 0) s.max_hp_cap = v;
@@ -989,6 +999,19 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
 using FnMaxHp = long long* (*)(long long* ret, const void* design, const void* mods,
                                const void* fleet, const void* tooltip);
 
+/// 每个 ModifierType 流经 ApplyModifierMult 的次数（诊断用，见 detour_apply_mul）。
+/// 声明在 detour_max_hp 之前：那里的 SAMPLE 会打这张直方图。
+std::atomic<uint64_t> g_type_hits[64];
+
+/// 「加算溢出塌成 0」的判定与封顶（见 detour_max_hp 里的详细说明）。
+///
+/// 倍率阈值：正常舰船的护盾/装甲倍率在 1~10 倍量级（实测 110468 = 1.10 倍）。
+/// 1e7 倍（factor 1e12）已经远超任何正常配置，配上 0 基数就是溢出现场。
+constexpr int64_t kCollapseFactor = 1000000000000LL;  ///< = 1e7 倍
+/// 封顶值：INT64_MAX/1e5 换算回存储值就是 int64 上界本身。
+/// 即「92 万亿游戏单位」那个天花板 —— 用户描述的那个数。
+constexpr int64_t kSaturateCap = INT64_MAX;
+
 /// 重算链的两个原语（只解析地址、不装钩子，见 HELPERS）。
 using FnShipSizeOf    = void* (*)(const void* design);
 using FnModifierValue = long long* (*)(const void* size, long long* out, const void* mods,
@@ -1048,6 +1071,22 @@ void dump_mods(const void* mods, char* buf, size_t cap) {
         off += (size_t)snprintf(buf + off, cap - off, "] n=%d", n);
     } else {
         off += (size_t)snprintf(buf + off, cap - off, "null]");
+    }
+}
+
+/// 护盾/装甲/船体上限这一族的 ModifierType。
+/// 由三个上限函数体读出：hull 0x1e/0x1f、shield 0x2e/0x2f + 0x1c8/0x1c9、
+/// armor 0x24/0x25 + 0x1c6/0x1c7。另外把邻近的 0x22/0x23、0x29/0x2a 也纳入 ——
+/// 它们是同一张表里护盾/装甲相关的兄弟项，一起看才看得出是谁把量级推爆的。
+inline bool is_hp_modifier_type(int t) {
+    switch (t) {
+        case 0x1e: case 0x1f:                       // hull add/mul
+        case 0x24: case 0x25: case 0x1c6: case 0x1c7:  // armor
+        case 0x2e: case 0x2f: case 0x1c8: case 0x1c9:  // shield
+        case 0x22: case 0x23: case 0x29: case 0x2a:    // 邻近兄弟项
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -1157,6 +1196,20 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
             is_sample = true;
             logf("SAMPLE#%llu %s 上限 = %lld (%.4f)", (unsigned long long)c, name,
                  (long long)v, static_cast<double>(v) / 1e5);
+            // 同一批把 ApplyModifierMult 的 ModifierType 直方图打出来，
+            // 回答「护盾/装甲/船体族到底有没有流经那个出口」。
+            if (g_settings.diag_modifier_calls > 0) {
+                char hb[900];
+                size_t off = 0;
+                off += (size_t)snprintf(hb + off, sizeof hb - off, "TYPES");
+                for (int t = 0; t < 64; ++t) {
+                    const uint64_t n2 = g_type_hits[t].load(std::memory_order_relaxed);
+                    if (n2 != 0 && off + 16 < sizeof hb)
+                        off += (size_t)snprintf(hb + off, sizeof hb - off, " %x=%llu", t,
+                                                (unsigned long long)n2);
+                }
+                logf("%s", hb);
+            }
         }
     }
 
@@ -1203,6 +1256,61 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
     }
 
     if (ok) {
+        // ★ 「溢出塌成 0」的封顶（2026-10-11 实测确认的根因）
+        // ------------------------------------------------
+        // 机制（三步，缺一不可）：
+        //   1) 加算项的真值超过 9.2e13 游戏单位（= INT64_MAX/1e5），
+        //      游戏自己的 mul 在拆分路径上 wrap 成**负数**；
+        //   2) GetModifierValue 对掩码类型有兜底 `if (v < 0) v = 0`（FUN_140d29dd0），
+        //      于是整项被夹成 **0**；
+        //   3) 上限 = (base + 0) × 倍率 = 0 —— 无论倍率多大都是 0。
+        //
+        // 实测证据（同一存档、同一条 design 指针的两次调用）：
+        //   正常舰船 装甲加算 0x24 = 2861907747，护盾加算 0x2e = 2861907747（两者相同）
+        //   出问题那台 装甲加算 0x24 = 11000000000，护盾加算 0x2e = 0  ← 被塌掉
+        //                 护盾乘算 0x2f = 1000000000000000（= 1e10 游戏单位 = 1e12%）
+        // 用户的原话「吃了一个 buff 计算大于 92 万亿溢出了」与
+        // INT64_MAX/1e5 = 92233720368547（≈92 万亿游戏单位）**精确吻合**。
+        //
+        // 判据：加算读到 0、基础值也是 0、而倍率巨大（正常舰船远达不到 1e7 倍）。
+        // 这一组合在物理上不成立（1e10 倍乘数配 0 基数），所以是溢出而非真实值。
+        // 封顶到 INT64_MAX —— 也就是那个「92 万亿」的上限。
+        const bool collapsed = v == 0 && d.add_in == 0 && d.base_raw == 0 &&
+                               d.factor >= kCollapseFactor;
+        if (collapsed) {
+            g_events.fetch_add(1, std::memory_order_relaxed);
+            // 限流：舰船详情面板每帧都会重算同一个 design，不限流一次点击能刷上万行
+            // （实测 19899 行把日志打满）。按 design 指针记「报过」，每条 design 只报一次。
+            bool first_for_this_design = false;
+            if (g_settings.verbose_events) {
+                static std::atomic<uint64_t> last_design{0};
+                static std::atomic<int> logged{0};
+                const uint64_t dp = reinterpret_cast<uint64_t>(design);
+                if (logged.load(std::memory_order_relaxed) < g_settings.collapse_log_limit &&
+                    last_design.exchange(dp, std::memory_order_relaxed) != dp) {
+                    logged.fetch_add(1, std::memory_order_relaxed);
+                    first_for_this_design = true;
+                }
+            }
+            if (first_for_this_design)
+                logf("EVENT %s 加算溢出塌成 0（倍率=%lld = %.2f 倍）-> 封顶到 %lld%s", name,
+                     (long long)d.factor, static_cast<double>(d.factor) / 1e5,
+                     (long long)kSaturateCap,
+#if SATFIX_REPLACE
+                     " [已回写]"
+#else
+                     " [影子模式，未改数值]"
+#endif
+                );
+#if SATFIX_REPLACE
+            if (r != nullptr) {
+                g_replaced.fetch_add(1, std::memory_order_relaxed);
+                *r = kSaturateCap;
+            }
+#endif
+            maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+            return r;
+        }
         if (sat != v) {
             // 重算与游戏不一致。只在**游戏值本身呈现 wrap 特征**时才认定溢出：
             //   * v < 0            —— 上限不可能为负，铁证
@@ -1354,6 +1462,14 @@ long long* detour_apply_mul(long long* ret, long long* value, const void* modifi
         whk::safe_read(&m_eff, r, sizeof m_eff);
         whk::safe_read(&v_game, value, sizeof v_game);
         shadow_apply_mul("ApplyModifierMult(cfx)", v0, m_eff, v_game, false, value);
+
+        // 统计每个 ModifierType 的调用次数（前 64 个类型），用来回答
+        // 「护盾/装甲/船体那一族到底有没有流经这个出口」。
+        // 用户那个「护盾 0」的现场里 0x2e=0 / 0x2f=1e15，
+        // 如果这些 type 一次都没从这里过，就说明污染在**别的出口**。
+        if (g_settings.diag_modifier_calls > 0 && modifier_type >= 0 && modifier_type < 64) {
+            g_type_hits[modifier_type].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
     return r;
