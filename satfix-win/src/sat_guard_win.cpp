@@ -312,13 +312,14 @@ enum : int {
     kIdxDiploWeight,
     kIdxMpe15,
     kIdxMpe7,
+    kIdxDamagePerDay,
     kIdxCount
 };
 
 // kIdx* 是**计数/报告**用的下标，与 kTargets[] 的顺序无关：安装走的是 t.key 字符串匹配，
 // 每个 detour 内部用自己那个 kIdx 常量，所以两边不会串。
 // 这里只钉住「下标个数 == 目标个数」，防止加了目标忘了加计数器。
-static_assert(kTargetCount == 17, "kIdx* 下标个数需要跟着 kTargets 更新");
+static_assert(kTargetCount == 18, "kIdx* 下标个数需要跟着 kTargets 更新");
 const char* const kIdxNames[kIdxCount] = {
     "GetRounded/GetRounded64",
     "operator fpml::fixed_point<...,15>",
@@ -337,11 +338,12 @@ const char* const kIdxNames[kIdxCount] = {
     "CalcDiplomaticWeight",
     "CalcMilitaryPowerExponent<15>",
     "CalcMilitaryPowerExponent<7>",
+    "CalcAverageDamagePerDay",
 };
 std::atomic<uint64_t> g_fn_calls[kIdxCount];
 bool g_fn_seen[kIdxCount] = {false, false, false, false, false, false, false, false,
                              false, false, false, false, false, false, false, false,
-                             false};
+                             false, false};
 
 /// 主线程泵：只在游戏主线程进入被 hook 函数时被调用。
 /// detour 里只做原子写，把重活推迟到这里 —— 满足手册 6.3。
@@ -959,7 +961,56 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
     return r;
 }
 
-//  9/10/11) NShipUtil::CalcMax{Shield,Armor,}HitPoints —— 护盾/装甲/船体上限
+//  17) NShipUtil::CalcAverageDamagePerDay —— 设计师面板的「伤害」
+//
+//  ABI（由唯一调用者 FUN_140c9e3f0 的 L142-143 确证，**不是 sret**）：
+//      void fn(void* obj /*rcx*/, int idx /*edx*/, long long* out /*r8*/, void* param_4 /*r9*/)
+//  它**没有返回值** —— 结果写进 out 结构。这是与 Linux 版最大的差异：
+//  Linux 的同一个函数 `return local_b8`（值在 rax），Windows 版改成写 out。
+//
+//  体内末尾（L699-710）就是溢出点：
+//      lVar9 = local_128 + 100000;                    // factor = add + 1.0
+//      if (lVar22 + 0xb504f333U < 0x16a09e667 && local_128 + 0xb50679d3U < 0x16a09e667)
+//          lVar9 = (lVar9 * lVar22) / 100000;         // ★ 裸 64 位乘，会 wrap
+//      else { ...拆分回退... }
+//
+//  OBSERVE：只观测不替换。原因是它的输出结构语义还没逆清 —— 硬回写有写坏
+//  其它字段的风险（一个结构里可能有多个统计值）。判据很硬：**伤害不可能为负**，
+//  所以负值或超过 int64 上界（9.2e13 游戏单位）就几乎必然是 wrap。
+//
+//  ⚠️ 结构偏移 `+0x98` 是**反编译读出来的**，不是从符号推的，所以打日志时
+//  也把它带出来，方便以后要升级成 EXACT 时核对。
+constexpr long long kDamageSane = 9223372036854775807LL / 100000;  // 9.2e13 游戏单位
+
+using FnDamagePerDay = void (*)(void* obj, int idx, long long* out, void* param_4);
+whk::TypedHook<FnDamagePerDay> g_hook_damage;
+
+void detour_damage_per_day(void* obj, int idx, long long* out, void* param_4) {
+    const int k = kIdxDamagePerDay;
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    g_fn_calls[k].fetch_add(1, std::memory_order_relaxed);
+    note_first_call(k);
+    game_thread_pump();
+
+    g_hook_damage.call(obj, idx, out, param_4);
+
+    if (out == nullptr) {
+        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+        return;
+    }
+    long long v = 0;
+    if (!whk::fast_read(&v, out, sizeof v)) {
+        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+        return;
+    }
+    if (v < 0 || v > kDamageSane) {
+        g_events.fetch_add(1, std::memory_order_relaxed);
+        if (g_settings.verbose_events)
+            logf("EVENT CalcAverageDamagePerDay 伤害=%lld (%.4f) —— 应为非负且 <= %lld，疑似 wrap",
+                 v, static_cast<double>(v) / 1e5, (long long)kDamageSane);
+    }
+    maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+}
 //
 //  ABI（三个函数同形，均由函数体确证）：
 //      long long* fn(long long* ret /*rcx*/, const void* design /*rdx*/,
@@ -1982,6 +2033,8 @@ void install_hooks() {
             ok = g_hook_armor_max.install(res[i].addr, &detour_armor_max);
         else if (std::strcmp(t.key, "hull_max") == 0)
             ok = g_hook_hull_max.install(res[i].addr, &detour_hull_max);
+        else if (std::strcmp(t.key, "damage_per_day") == 0)
+            ok = g_hook_damage.install(res[i].addr, &detour_damage_per_day);
         else {
             logf("目标 %s 没有对应的 detour（目标表与代码不同步）", t.key);
             continue;

@@ -5,8 +5,8 @@
 //  文件大小   : 44948088 字节
 //  PE TimeDateStamp : 0x6ABEAA3F
 //  ImageBase  : 0x140000000
-//  生成时间   : 2026-10-11 19:22:03
-//  确证目标   : 17/18（另有 1 个尚未定位）
+//  生成时间   : 2026-10-11 21:40:55
+//  确证目标   : 18/19（另有 1 个尚未定位）
 //
 //  与 Linux 侧的根本差别
 //  ---------------------
@@ -26,7 +26,7 @@
 #define SATFIX_WIN_EXE_TIMESTAMP 0x6ABEAA3Fu
 #define SATFIX_WIN_IMAGE_BASE    0x140000000ull
 #define SATFIX_WIN_SIG_LEN       16
-#define SATFIX_WIN_FOUND         "17/18"
+#define SATFIX_WIN_FOUND         "18/19"
 #define SATFIX_WIN_UNRESOLVED    1
 
 namespace satfix_win {
@@ -73,6 +73,7 @@ inline const uint8_t kSig_cfx_safe_sqrt[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c
 inline const uint8_t kSig_diplo_weight[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x56, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20, 0x49, 0x8b, 0x40 };
 inline const uint8_t kSig_mpe15[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x8b, 0x0a, 0x49, 0x8b, 0xf8 };
 inline const uint8_t kSig_mpe7[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x8b, 0x0a, 0x49, 0x8b, 0xf8 };
+inline const uint8_t kSig_damage_per_day[SATFIX_WIN_SIG_LEN] = { 0x4c, 0x89, 0x4c, 0x24, 0x20, 0x4c, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x55 };
 inline const uint8_t kSig_access_var_pointer[SATFIX_WIN_SIG_LEN] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x78, 0x18, 0x41 };
 inline const uint8_t kSig_cvars_get[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55 };
 inline const uint8_t kSig_cvars_set[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x4c, 0x89, 0x44, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x40, 0x48 };
@@ -98,6 +99,7 @@ inline const Target kTargets[] = {
     {"diplo_weight", "CPopJob::CalcDiplomaticWeight(CPopGroup const&) const", 0x00838670u, kSig_diplo_weight, kObserve, "**本轮最有价值的一个 —— 用「NDefines 名字 thunk」定出来的全新方法。**难点背景：这个函数在 Linux 里**没有任何直接调用者**（只有 4 处提及，全是它自己），所以「调用者法」对它无效；而按守卫密度筛出 24 个候选、按结构偏移 `+0x808` 命中 0 个。**突破口**：Paradox 的 NDefines 名字字符串（如 `DIPLOMACY_WEIGHT_POP_BASE`）确实存在于 exe 的 .rdata（VA 0x142360e08）。扫 .text 找 rip-relative 引用它的指令，**各只有 1 处**，落在 0x382580 / 0x3825a0。反汇编那两处是一个 5 指令 thunk：`mov rcx,rdx; lea r9,[全局]; lea rdx,[\"NGameplay\"]; lea r8,[\"<名字>\"]; jmp <注册函数>` —— 于是**名字 -> 全局地址**的对应关系被直接读出来：`DIPLOMACY_WEIGHT_POP_BASE -> 0x143151010`、`DIPLOMACY_WEIGHT_POP_HAPPINESS -> 0x143151008`。再在全部 110843 个函数块里找「同时读这两个全局」的函数 —— **命中数 = 1**，就是本函数。**体形逐条对上 Linux（1177404-1177484）**：`param_3+8` 虚调用（Linux `param_10+8` 的 vtable slot）、`param_1+0x18` 取 CJobType（同偏移）、`param_1+0xec` 计数 / `param_1+0xe0` 数组（**两个偏移与 Linux 完全相同**）、`(arr)[i*2+1] * 100000`、`(lVar4 * DAT_143151010)/100000`（= 乘 POP_BASE）、`FUN_14067eec0(param_3)`（= CPopGroup::HasHappiness）、`(uVar5 * DAT_143151008)/100000`（= 乘 POP_HAPPINESS）、`*(param_3+0x8b0)` 再相乘、最后 `uVar5 + lVar4` 求和并写回 sret。**顺带解答了上轮的疑问**：Linux 读 `param_10+0x808`，Windows 读 `param_3+0x8b0` —— 这就是为什么按 `+0x808` 检索命中 0 个。MSVC 布局差异又一次得到实证。ABI：sret（`*param_2 = uVar5; return param_2`），签名 `longlong* fn(const void* self /*rcx*/, longlong* ret /*rdx*/, const void* group /*r8*/)`。策略 OBSERVE：与 Linux 同 —— 外交权重是各项加权和，**不可能为负**；返回负数或量级离谱就是 wrap 的证据，不需要复算。"},
     {"mpe15", "NCombatRules::CalcMilitaryPowerExponent(fpml::fixed_point<long long,48,15>, fpml::fixed_point<long long,48,15>)", 0x00a0a4a0u, kSig_mpe15, kObserve, "**靠「NDefines 名字法」顺出来的（第三个方法，本轮第二次用它破局）。**上两轮对这个目标完全卡住：调用者法无效（调用者不带独占字符串）、常量法无效（Linux 的 0x15bf1 与 0x7fffffff8000 在 Windows 侧都是 0 次）、递归判据无效（73 个自递归函数里没有一个是它）。本轮先用 NDefines 名字法建出 **2369 个** (名字, 组, 全局地址) 三元组（解析器用已确证的 DIPLOMACY_WEIGHT_POP_BASE/HAPPINESS 做校准，两者地址与前面独立确证的结果**完全一致**，证明解析器可信），于是拿到 `MILITARY_POWER_EXPONENT -> 0x1431505B0`（组 = NShip）。顺着它找到唯一读它的函数 FUN_140a08960，它把这个 define 当**指数**传给 `FUN_140a0a610` —— 那就是幂函数。`FUN_140a0a610` 的移位是 `<<7` / `>>7` / `0x80` / `0x7f`，是 **fp7** 编码，所以它是 mpe7；而它紧邻的 `FUN_140a0a4a0`（同样的体形、同样调用一个 log2 辅助）移位是 `<<0xf` / `>>0xf` / `0x8000` / `0x7fff`，是 **fp15**，即本目标。**编码判定与 Linux 完全吻合**：Linux mpe15 体内的掩码常量是 0x7fffffff8000 / 0xffffffffffff8000（fp15 的 0x7fff/0x8000），Linux mpe7 的是 0x7fffffff80 / 0xffffffffffffff80（fp7 的 0x7f/0x80）。体形也一致：都是「处理负指数 -> 调 log2 辅助 -> 累加收敛循环」，收敛条件都是 `while (sum != next + sum)`（加下一项不再改变和即停）。ABI：sret —— `longlong* fn(longlong* out /*rcx*/, const longlong* base /*rdx*/, const longlong* exp /*r8*/)`。**注意参数顺序**：Linux 版是 (out, 指数, 底数)，Windows 是 (out, 底数, 指数) —— 两者相反。这是本轮第 4 次「同族函数 ABI 顺序不一致」的实例。策略 OBSERVE：Linux 侧同 —— 只记录「中间积会撑爆 int64」的调用，不改数值（pow 的等价饱和实现风险高）。"},
     {"mpe7", "NCombatRules::CalcMilitaryPowerExponent(fpml::fixed_point<long long,56,7>, fpml::fixed_point<long long,56,7>)", 0x00a0a610u, kSig_mpe7, kObserve, "与 mpe15 同源、同一轮确证（见上条）。判据是**编码**：本函数用 `<<7` / `>>7` / `0x80` / `0x7f` / `0xffffffffffffff80`，是 fpml 的 7 位小数编码；而 Linux mpe7 体内的掩码常量正是 0x7fffffff80 / 0xffffffffffffff80 / 0xffffffffffffff00 —— 逐个对上。**额外证据**：唯一读 `MILITARY_POWER_EXPONENT` 的函数 FUN_140a08960 就是调用本函数（不是 0xA0A4A0），且它整条路径都用 `>> 7` / `>> 8` 的移位 —— 说明军力权重那条代码路径确实走 fp7 编码。它还有一个专用的 log2 辅助 FUN_140a0a840（fp7 版），与 mpe15 用的 FUN_140a0a770（fp15 版）成对。ABI 与 mpe15 相同：`longlong* fn(longlong* out, const longlong* base, const longlong* exp)`。策略 OBSERVE，同 Linux。"},
+    {"damage_per_day", "NShipUtil::CalcAverageDamagePerDay(CBaseDesignImplementation const&, ...) —— 设计师面板的「伤害」", 0x003c2910u, kSig_damage_per_day, kObserve, "**对照 Linux 符号名定出来的（用户建议「对照 linux 版本的代码库」，一次命中）。**Linux 侧这个函数叫 `NShipUtil::CalcAverageDamagePerDay`（868 行），体内有一个**独占的安全界常量 `0xb50679d3`**（不是常见的 0xb504f333）—— 它出现在末尾那次「乘以 (add+1.0)」的快速路径判定里：`if (x + 0xb50679d3 < 0x16a09e667) ...`。在 Windows dump 里搜该常量只得到 3 个候选，其中 FUN_1403c2910 是 851 行（Linux 868 行，量级吻合），且体内**恰好也只有 1 处** 0xb50679d3（末尾）。**逐条对上 Linux**：末尾算式 Linux `local_b8 = (local_b8 * (local_60+100000)) / 100000`对应 Windows `lVar9 = (lVar9 * lVar22) / 100000`（L700，同一位置）；拆分回退分支 `(X%1e5)*Y/1e5 + (X/1e5)*Y` 两边逐字一致；GetModifierValue 的调用点两边都用 `CShipSize::GetModifierValue`，且 Windows 侧传的 type 0x41/0x168/0x230 与 Linux 的 0x41/0x168/0x230 **同号**。**溢出点**：L699-710 那次乘法是**裸 64 位乘**，没有饱和 —— 伤害被 mod 堆大后在这里 wrap。**为什么是 OBSERVE**：它的 ABI 与 Linux 不同 —— Linux 版 `return local_b8`（值在 rax），Windows 版是 `void fn(obj, int idx, longlong* out, param_4)`（唯一调用者 FUN_140c9e3f0 的 L142-143 确证），结果写进 out 结构的 `+0x98`。要回写就得先逆清那个 out 结构的语义，风险高于收益，所以先观测。判据：伤害不可能为负，出现负数或量级离谱（> 9.2e13 游戏单位）就是 wrap。"},
 };
 
 inline constexpr int kTargetCount = sizeof(kTargets) / sizeof(kTargets[0]);

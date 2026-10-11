@@ -409,6 +409,32 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "ABI 与 mpe15 相同：`longlong* fn(longlong* out, const longlong* base, "
         "const longlong* exp)`。策略 OBSERVE，同 Linux。",
     ),
+    (
+        "damage_per_day",
+        "NShipUtil::CalcAverageDamagePerDay(CBaseDesignImplementation const&, ...) "
+        "—— 设计师面板的「伤害」",
+        0x003C2910,
+        "OBSERVE",
+        "**对照 Linux 符号名定出来的（用户建议「对照 linux 版本的代码库」，一次命中）。**"
+        "Linux 侧这个函数叫 `NShipUtil::CalcAverageDamagePerDay`（868 行），"
+        "体内有一个**独占的安全界常量 `0xb50679d3`**（不是常见的 0xb504f333）—— "
+        "它出现在末尾那次「乘以 (add+1.0)」的快速路径判定里："
+        "`if (x + 0xb50679d3 < 0x16a09e667) ...`。"
+        "在 Windows dump 里搜该常量只得到 3 个候选，其中 FUN_1403c2910 是 851 行"
+        "（Linux 868 行，量级吻合），且体内**恰好也只有 1 处** 0xb50679d3（末尾）。"
+        "**逐条对上 Linux**："
+        "末尾算式 Linux `local_b8 = (local_b8 * (local_60+100000)) / 100000`"
+        "对应 Windows `lVar9 = (lVar9 * lVar22) / 100000`（L700，同一位置）；"
+        "拆分回退分支 `(X%1e5)*Y/1e5 + (X/1e5)*Y` 两边逐字一致；"
+        "GetModifierValue 的调用点两边都用 `CShipSize::GetModifierValue`，"
+        "且 Windows 侧传的 type 0x41/0x168/0x230 与 Linux 的 0x41/0x168/0x230 **同号**。"
+        "**溢出点**：L699-710 那次乘法是**裸 64 位乘**，没有饱和 —— 伤害被 mod 堆大后在这里 wrap。"
+        "**为什么是 OBSERVE**：它的 ABI 与 Linux 不同 —— Linux 版 `return local_b8`（值在 rax），"
+        "Windows 版是 `void fn(obj, int idx, longlong* out, param_4)`（唯一调用者 "
+        "FUN_140c9e3f0 的 L142-143 确证），结果写进 out 结构的 `+0x98`。"
+        "要回写就得先逆清那个 out 结构的语义，风险高于收益，所以先观测。"
+        "判据：伤害不可能为负，出现负数或量级离谱（> 9.2e13 游戏单位）就是 wrap。",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
