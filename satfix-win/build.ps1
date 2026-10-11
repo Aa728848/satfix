@@ -73,9 +73,17 @@ if ($LASTEXITCODE -ne 0) { throw '定点对拍失败，别往下走' }
 
 # ---- 插件 DLL --------------------------------------------------------------
 $replaceVal = if ($Replace) { 1 } else { 0 }
+
+# 版本号从清单读，编译期注入 —— 避免源码里硬编码版本号后与清单脱节
+# （发布说明、tag、清单 version 三者必须一致，让源码成为第 4 个手工同步点太脆）。
+$manifest = Get-Content (Join-Path $Here 'plugin\stl-plugin.json') -Raw | ConvertFrom-Json
+$pluginVersion = $manifest.version
+if (-not $pluginVersion) { throw 'plugin\stl-plugin.json 里没有 version' }
+Write-Host "[build] 清单版本：$pluginVersion"
+
 Invoke-Cl -What "编译插件 DLL（SATFIX_REPLACE=$replaceVal）" -ClArgs ($common + @(
     "/DSATFIX_REPLACE=$replaceVal",
-    '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX',
+    "/DSATFIX_VERSION=$pluginVersion",    '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX',
     "/Fo`"$Out\\`"", "/Fe`"$Out\satfix.dll`"",
     '/LD', "`"$Here\src\sat_guard_win.cpp`"", '/link', '/INCREMENTAL:NO'
 ))

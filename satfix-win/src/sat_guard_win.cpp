@@ -67,6 +67,16 @@
 const char* const kBuildMode =
     SATFIX_REPLACE ? "satfix-build-mode:write-back" : "satfix-build-mode:shadow";
 
+// 版本号：build.ps1 从 plugin\stl-plugin.json 读出来、编译期注入（-DSATFIX_VERSION）。
+// 注意它是个**裸记号**（如 0.3.0），不是字符串字面量 —— 用两级宏把它字符串化。
+// 兜底值只用于「有人绕过 build.ps1 直接调 cl.exe」的场合，正常构建不会走到。
+#ifndef SATFIX_VERSION
+#define SATFIX_VERSION unknown
+#endif
+#define SATFIX_STR2(x) #x
+#define SATFIX_STR(x) SATFIX_STR2(x)
+#define SATFIX_VERSION_STR SATFIX_STR(SATFIX_VERSION)
+
 #ifndef SATFIX_MAX_LOGS
 // 500 行在开心跳时会不够用（实测：20000 次调用一块，几十秒就写满）。
 // 提到 4000：既能容纳一整局的心跳，也不会让日志无限增长。
@@ -2000,7 +2010,9 @@ void install_hooks() {
     whk::set_logger(&whk_log);
 
     // ---- 第一行记版本/路径/构建（手册 9.1）----
-    logf("satfix-win 0.2.0  REPLACE=%d  %s", SATFIX_REPLACE, kBuildMode);
+    // 版本号由 build.ps1 从 plugin\stl-plugin.json 读出来、编译期注入（-DSATFIX_VERSION）。
+    // 这样清单、tag、发布说明三者一致时，日志里的版本也自动一致，不会脱节。
+    logf("satfix-win %s  REPLACE=%d  %s", SATFIX_VERSION_STR, SATFIX_REPLACE, kBuildMode);
     {
         wchar_t exe[MAX_PATH * 2] = {};
         GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
