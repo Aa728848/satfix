@@ -1030,13 +1030,23 @@ struct MaxHpRecipe {
     int     type_mul;         ///< 乘算修正的 ModifierType
     int     type_class_base;  ///< 船级修正（加到 base），0 = 未建模
     int     type_class_mul;   ///< 船级修正（加到 add），0 = 未建模
+    /// 这个上限的「值」是否住在**加算项**里（而不是基础值）。
+    ///
+    /// 实测（同一条 design 的正常舰船，见日志 DIAG 行）：
+    ///   shield base=0        add_in=2861907747   <- 值在加算项
+    ///   armor  base=0        add_in=2861907747   <- 与护盾完全相同
+    ///   hull   base=5e9      add_in=0            <- 值在基础值，加算项恒为 0
+    /// 这决定了「加算项被塌成 0」这条判据能不能用：对护盾/装甲，
+    /// `add_in == 0` 是异常（值本该在这）；对船体，它是**正常状态**，
+    /// 拿它当判据会误伤。所以按目标分别开关。
+    bool    add_carries_value;
 };
 
-constexpr MaxHpRecipe kRecipeShield = {0x130, 0x2e, 0x2f, 0x1c8, 0x1c9};
-constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x24, 0x25, 0x1c6, 0x1c7};
-// 船体的船级修正在体里是 0x1ca/0x1ed/0x1ee 一簇条件分支，触发条件
-// （虚调用 + FUN_140c67d40 < 2）尚未逆清，所以不建模 —— 只做 base×factor 主链。
-constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x1e, 0x1f, 0, 0};
+constexpr MaxHpRecipe kRecipeShield = {0x130, 0x2e, 0x2f, 0x1c8, 0x1c9, true};
+constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x24, 0x25, 0x1c6, 0x1c7, true};
+// 船体：add_carries_value = false —— 它的 add_in 正常就是 0，不能当溢出判据。
+// 它的溢出走另一条路（base 非 0，乘爆后 wrap），由下面的 `v < 0` 那条分支兜。
+constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x1e, 0x1f, 0, 0, false};
 
 /// 用游戏自己的原语饱和重算上限。成功返回 true 并把结果写进 `*out`。
 /// 任一原语没解析到（辅助函数签名校验失败）就返回 false，调用方退化成「只认负数」。
@@ -1263,20 +1273,32 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
         //      游戏自己的 mul 在拆分路径上 wrap 成**负数**；
         //   2) GetModifierValue 对掩码类型有兜底 `if (v < 0) v = 0`（FUN_140d29dd0），
         //      于是整项被夹成 **0**；
-        //   3) 上限 = (base + 0) × 倍率 = 0 —— 无论倍率多大都是 0。
+        //   3) factor = add + 1.0 随之变成 1.0？不 —— 见下。
         //
-        // 实测证据（同一存档、同一条 design 指针的两次调用）：
-        //   正常舰船 装甲加算 0x24 = 2861907747，护盾加算 0x2e = 2861907747（两者相同）
-        //   出问题那台 装甲加算 0x24 = 11000000000，护盾加算 0x2e = 0  ← 被塌掉
-        //                 护盾乘算 0x2f = 1000000000000000（= 1e10 游戏单位 = 1e12%）
-        // 用户的原话「吃了一个 buff 计算大于 92 万亿溢出了」与
-        // INT64_MAX/1e5 = 92233720368547（≈92 万亿游戏单位）**精确吻合**。
+        // **三个函数共用同一个夹取**（逐个读体确认，行号各异但形状相同）：
+        //      shield L353-356: lVar11 = lVar11 + 100000; if (lVar11 < 0) lVar11 = 0;
+        //      armor  L293-296: uVar5  = lVar7  + 100000U; if ((longlong)(...) < 0) uVar5 = 0;
+        //      hull   L380-383: lVar12 = lVar11 + 100000; if (lVar11 + 100000 < 0) lVar12 = 0;
+        //   注意夹的是 **add + 1.0**，不是 add 本身：所以当 add 被塌成 0 时
+        //   factor = 0 + 100000 = 1.0（**不是 0**）。于是：
+        //      上限 = (base + 0) × 1.0 / 1e5
+        //   护盾/装甲 base=0 -> 结果 0；船体 base=5e9 -> 结果 = base（**丢掉全部倍率**）。
+        //   两者都是"数值被毁"，只是毁法不同。
         //
-        // 判据：加算读到 0、基础值也是 0、而倍率巨大（正常舰船远达不到 1e7 倍）。
-        // 这一组合在物理上不成立（1e10 倍乘数配 0 基数），所以是溢出而非真实值。
+        // 实测证据（同一存档、同一条 design 指针）：
+        //   正常舰船  装甲加算 0x24 = 2861907747  护盾加算 0x2e = 2861907747（两者相同）
+        //   出问题那台 装甲加算 0x24 = 11000000000 护盾加算 0x2e = 0  ← 被塌掉
+        //            护盾乘算 0x2f = 1000000000000000（1e10 游戏单位 = 1e12%）
+        //   用户原话「吃了一个 buff 计算大于 92 万亿溢出了」与
+        //   INT64_MAX/1e5 = 92233720368547 **精确吻合**。
+        //
+        // 判据：**加算项读到 0、而倍率巨大**（正常舰船是 1.1 倍量级，1e7 倍不可能是真值）。
+        //   只对 `add_carries_value` 的目标（护盾/装甲）生效 —— 它们的值本该住在加算项里，
+        //   读到 0 就是被塌掉。船体的加算项**正常就是 0**，用这条会误伤，已排除。
+        //   不需要额外要求 v==0：护盾/装甲的 base 恒为 0，add_in==0 时结果必然是 0。
         // 封顶到 INT64_MAX —— 也就是那个「92 万亿」的上限。
-        const bool collapsed = v == 0 && d.add_in == 0 && d.base_raw == 0 &&
-                               d.factor >= kCollapseFactor;
+        const bool collapsed =
+            recipe.add_carries_value && d.add_in == 0 && d.factor >= kCollapseFactor;
         if (collapsed) {
             g_events.fetch_add(1, std::memory_order_relaxed);
             // 限流：舰船详情面板每帧都会重算同一个 design，不限流一次点击能刷上万行
