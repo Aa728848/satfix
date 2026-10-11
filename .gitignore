@@ -1,6 +1,9 @@
 # 构建产物（Windows 侧）
 satfix-win/build/
 satfix-win/dist/
+# release\ 是 package_release.ps1 的产出（zip + sha256 + 展开的 stage\），
+# 由 GitHub Release 承载，不进仓库。
+satfix-win/release/
 # plugin\ 是链接用的工作目录：清单与 defaults\ 是**源码**（要提交），
 # config\、logs\、satfix.dll 是运行时产物（不提交）。
 satfix-win/plugin/logs/
