@@ -15,8 +15,11 @@
 //    9    日志写 <插件文件夹>\logs\，用 _SH_DENYWR 允许游戏运行时读取
 //    4/7  清单里列 exe_timestamps，DLL 自己也校验 PE 时间戳与序言签名
 //
-//  默认是**影子模式**：只观测、只打日志，绝不改游戏数值。
-//  编译时 -DSATFIX_REPLACE=1 才会在检出溢出时回写饱和值。
+//  两种构建模式（编译期开关，见 build.ps1）：
+//    -Replace  -> 回写模式：检出溢出就把值改成饱和值。**发布版用这个**。
+//    不加参数  -> 影子模式：只观测、只打日志，不改游戏数值。开发自测用。
+//  模式会打进二进制（kBuildMode 那个 marker），日志第一行也会写出来，
+//  所以拿到一个 dll 能当场验出是哪种，不用靠记性。
 //
 //  覆盖范围：src/satfix_targets_win.generated.hpp 里已确证的目标。
 //  未定位的目标会在启动日志里逐条列出 —— 不假装支持。
@@ -609,9 +612,12 @@ bool var_read_operand(const void* self, const void* scope, long long* d_out) {
     return true;
 }
 
-/// 影子复算：`op` 取 "add" 或 "mul"。饱和结果与游戏写回值不一致就记一条 EVENT。
+/// 变量系统的影子复算 + 回写。
 ///
-/// 前 kSampleLog 次调用会**无条件**打印 (v0, d, v1, sat) 四元组：
+/// `op` 取 "add" 或 "mul"。调原函数拿到游戏写回的值 v1，与饱和值 sat 比对：
+/// 不一致就是游戏 wrap 了，记一条 EVENT；回写模式下再用 SetVariable 把 sat 写回去。
+///
+/// 前 kSampleLog 次调用会无条件打印 (v0, d, v1, sat) 四元组：
 /// 「0 条 EVENT」既可能是真的一致，也可能是影子读到的值根本没意义。
 /// 只有把读到的三元组打出来、看着它满足 `v1 == v0 op d`，才能证明这条读回链是通的。
 /// 有界输出（每个操作最多 3 行），不会刷日志。
@@ -665,7 +671,8 @@ void detour_var_mul(const void* self, const void* scope) {
     note_first_call(idx);
     game_thread_pump();
     if (g_settings.enabled && g_settings.verify_variables)
-        shadow_variable("multiply_variable", "mul", self, scope, g_hook_var_mul);    else
+        shadow_variable("multiply_variable", "mul", self, scope, g_hook_var_mul);
+    else
         g_hook_var_mul.call(self, scope);
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
 }
@@ -1000,8 +1007,17 @@ whk::TypedHook<FnApplyMulFp15> g_hook_apply_mul_fp15;
 
 /// 两个重载共用的影子逻辑：v_game 已经是原函数写回后的值。
 /// `is_fp15` 决定用 >>15 还是 /1e5 的语义。
-void shadow_apply_mul(const char* name, int64_t v0, int64_t m_eff, int64_t v_game,
-                      bool is_fp15) {
+/// ApplyModifierMult 的影子复算 + 回写。
+///
+/// `value` 是那个被就地改写的 CFixedPoint&，`m_eff` 是原函数返回的实际生效倍率。
+/// 游戏算的是 `v0 * m_eff`（定点，除 1e5）；我们用饱和版本重算一遍比对，
+/// 不一致就是游戏 wrap 了 —— 回写模式下把饱和值写回 `*value`。
+///
+/// 这里能安全回写是因为**游戏自己已经把结果写进 `*value` 了**：
+/// 我们只是在一个已经写好的槽上覆盖一个更合理的值，不改变调用约定、
+/// 不需要逆清 CModifier 的内部结构。
+void shadow_apply_mul(const char* name, int64_t v0, int64_t m_eff, int64_t v_game, bool is_fp15,
+                      long long* value) {
     const int64_t sat = is_fp15 ? stlfix::mul_shift_sat(v0, m_eff, stlfix::kFp15Shift)
                                 : cfx::mul(v0, m_eff);
     if (v_game != sat) {
@@ -1009,6 +1025,13 @@ void shadow_apply_mul(const char* name, int64_t v0, int64_t m_eff, int64_t v_gam
         if (g_settings.verbose_events)
             logf("EVENT %s v0=%lld mult=%lld game=%lld sat=%lld", name, (long long)v0,
                  (long long)m_eff, (long long)v_game, (long long)sat);
+#if SATFIX_REPLACE
+        // 写回饱和值。value 是游戏传进来的那个槽，非 const，可以直接改。
+        if (value != nullptr) {
+            g_replaced.fetch_add(1, std::memory_order_relaxed);
+            *value = sat;
+        }
+#endif
     }
 }
 
@@ -1029,7 +1052,7 @@ long long* detour_apply_mul(long long* ret, long long* value, const void* modifi
         int64_t m_eff = 0, v_game = 0;
         whk::safe_read(&m_eff, r, sizeof m_eff);
         whk::safe_read(&v_game, value, sizeof v_game);
-        shadow_apply_mul("ApplyModifierMult(cfx)", v0, m_eff, v_game, false);
+        shadow_apply_mul("ApplyModifierMult(cfx)", v0, m_eff, v_game, false, value);
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
     return r;
@@ -1053,7 +1076,7 @@ long long* detour_apply_mul_fp15(long long* ret, long long* fp15_value, const vo
         int64_t m_eff = 0, v_game = 0;
         whk::safe_read(&m_eff, r, sizeof m_eff);
         whk::safe_read(&v_game, fp15_value, sizeof v_game);
-        shadow_apply_mul("ApplyModifierMult(fp15)", v0, m_eff, v_game, true);
+        shadow_apply_mul("ApplyModifierMult(fp15)", v0, m_eff, v_game, true, fp15_value);
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
     return r;
@@ -1078,8 +1101,8 @@ long long* detour_apply_mul_fp15(long long* ret, long long* fp15_value, const vo
 //    * 全程 SEH 包住；任何异常都只是少打几行日志，不会影响游戏。
 //    * 只有 SATFIX_WIN_FORCE=1 时才跑（留给自动化/回归用，正常游玩不受影响）。
 //
-//  注意：探针调用会**返回被 hook 函数的原值**，不改任何东西（影子模式）；
-//        开了 REPLACE 时探针拿到的是饱和值，日志里会标出来。
+//  注意：探针的返回值随模式而变 —— 影子模式下是游戏原本的值，
+//        回写模式下是饱和值。两者日志上长得一样，所以要看 kBuildMode 那行区分。
 // ===========================================================================
 void run_live_probe() {
     char b[8] = {};

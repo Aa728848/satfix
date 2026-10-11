@@ -3,7 +3,7 @@
   "id": "satfix",
   "name": "satfix — 定点溢出守卫",
   "version": "0.2.0",
-  "description": "挂钩 Stellaris 的定点算术出口，检出并（可选）修复 int64 溢出。默认影子模式：只记录，不改数值。",
+  "description": "修掉群星里定点数溢出翻负的问题：海军容量、资源、外交权重这些被 mod 堆到极大之后会悄悄变成负数，插件检出并改回饱和值。",
   "dll": "satfix.dll",
   "game": {
     "exe_timestamps": [

@@ -1,39 +1,34 @@
 # satfix —— Stellaris 定点溢出守卫
 
-把 Stellaris 的定点算术接上**饱和处理**，让后期存档里那些被 mod 推到天文数字的
-数值不再静默 wrap 成负数。
+给 Stellaris 的定点算术加饱和处理，让后期存档里被 mod 推到天文数字的数值停在上限，而不是静默 wrap 成负数。
 
-同一个守卫有两份实现，语义对齐：
+两个平台各有一份实现，语义一致：
 
 | 目录 | 平台 | 注入方式 |
 |---|---|---|
 | [`satfix/`](satfix/) | Linux | `LD_PRELOAD` 预加载 `.so`，按 mangled 名 `dlsym` 定位 |
-| [`satfix-win/`](satfix-win/) | Windows | Stellaris Launcher 的 DLL 插件，按 **RVA + 序言签名** 定位 |
+| [`satfix-win/`](satfix-win/) | Windows | Stellaris Launcher 的 DLL 插件，按 RVA + 序言签名定位 |
 
-## 为什么值得做
+## 溢出是怎么发生的
 
-Stellaris 的定点数用 `int64` 存，1.0 记作 `100000`。上限是 `9.22e18 / 1e5 ≈ 9.2e13`
-游戏单位。原版离这个上限极远，但 mod 堆叠乘法很容易越过 —— 越过之后**不报错**，
-直接 wrap 成负数：海军容量变成负的、资源扣成天文数字、外交权重突然为负。
+Stellaris 的定点数用 `int64` 存，1.0 记作 `100000`，上限约 `9.22e18 / 1e5 ≈ 9.2e13` 游戏单位。原版离这个上限极远，mod 堆叠乘法就很容易越过去。越过去之后游戏既不报错也不崩溃，直接 wrap 成负数：海军容量变成负的、资源扣成天文数字、外交权重突然为负。
 
-这类 bug 难查，因为它不崩、不报错，只是数值不对。
+这类 bug 难查，原因就在这里：它不崩、不报错，只是数值不对。
 
 ## 现状
 
-**Windows 侧 17/17 目标全部实机验证**（Linux 侧 19 个 hook 目标在 Windows 上全部覆盖）：
+Windows 侧 17 个目标全部实机验证通过（Linux 侧的 19 个 hook 目标在 Windows 上都有覆盖）：
 
 | | EXACT（能真正修数值） | INPUT_GUARD | OBSERVE |
 |---|---|---|---|
 | Linux | 6 | 2 | 11 |
 | Windows | 6 | 1 | 10 |
 
-- EXACT 集合两个平台**完全相同**：`cfx_get_rounded`、`cfx_to_fp15`、
-  两个 `ApplyModifierMult`、`var_add`、`var_multiply`。
-- `cfx_get_rounded64` 因 MSVC 的 COMDAT 折叠与 `cfx_get_rounded` 同地址，一个钩子覆盖两者。
-- `cfx_safe_sqrt_int` 在 Windows 侧**无对应代码**（MSVC 不生成该重载的那步换算），
-  详见 `satfix-win/README.md` §0.1.11。
+EXACT 集合两个平台完全相同：`cfx_get_rounded`、`cfx_to_fp15`、两个 `ApplyModifierMult`、`var_add`、`var_multiply`。
 
-一局后期 mod 存档的实测：**2390 万次调用，0 条真实分歧**，游戏全程稳定。
+`cfx_get_rounded64` 因 MSVC 的 COMDAT 折叠与 `cfx_get_rounded` 同地址，一个钩子覆盖两者。`cfx_safe_sqrt_int` 在 Windows 侧没有对应代码（MSVC 不生成该重载里那步换算），详见 `satfix-win/README.md` §0.1.11。
+
+一局后期 mod 存档的实测：2390 万次调用，0 条真实分歧，游戏全程稳定。
 
 ## 快速开始
 
@@ -72,18 +67,18 @@ cd satfix
 LD_PRELOAD=$PWD/sat_guard.so ./stellaris
 ```
 
-## 两种模式（重要）
+## 两种模式
+
+发布给用户的是回写模式。影子模式只用于开发自测，不随发布包分发。
 
 | 模式 | 编译 | 行为 | 用途 |
 |---|---|---|---|
-| **回写** | `-Replace` | 检出溢出时**把值改写成饱和值** | **发布给用户的版本** |
-| 影子 | 默认 | 只**检出并记录**，不改数值 | 我们自己的测试 |
+| 回写 | `-Replace` | 检出溢出时把值改写成饱和值 | 发布给用户的版本 |
+| 影子 | 默认 | 只检出并记录，不改数值 | 开发自测 |
 
-这是**编译期**开关（Linux 侧 `SATFIX_REPLACE=1`），故意不做成配置项 ——
-避免手动注入时误改存档。
+这是编译期开关（Linux 侧 `SATFIX_REPLACE=1`），故意不做成配置项，免得手动注入时误改存档。
 
-**怎么当场确认一个 DLL 是哪种模式**：每种构建都往二进制里打了一个 marker，
-字节搜索即可，不用靠记性（两种 DLL 大小几乎相同）：
+确认手上那个 DLL 是哪种模式，不用靠记性：每种构建都会往二进制里打一个 marker，字节搜索即可，两种 DLL 大小几乎相同。
 
 ```
 satfix-build-mode:write-back     回写
@@ -91,36 +86,32 @@ satfix-build-mode:shadow         影子
 ```
 
 日志首行也会写出来：`satfix-win 0.2.0  REPLACE=1  satfix-build-mode:write-back`。
-`tools/package_release.ps1` 默认**要求 write-back**，打错模式会直接拒绝打包。
+`tools/package_release.ps1` 默认要求 write-back，打错模式会直接拒绝打包。
 
-回写路径有端到端验证（同一构建脚本只差一个开关）：
+回写路径有端到端验证，同一构建脚本只差一个开关：
 
 | 构建 | `GetRounded(INT64_MAX)` 返回 | 含义 |
 |---|---|---|
 | shadow | `-92233720368547` | 游戏 wrap 后的值（就是那个 bug） |
 | **write-back** | `+92233720368547` | **饱和值（被纠正了）** |
 
-## 定位方法（Windows 侧）
+## Windows 侧怎么定位目标
 
-`stellaris.exe` 没有 PDB、只导出 110 个符号、没有任何 C++ 符号，
-所以**不能**像 Linux 那样按 mangled 名解析。`satfix-win/` 用的办法是
-**RVA + 16 字节序言签名**，签名不匹配就停用该目标并写日志 —— 不盲目读写内存。
+`stellaris.exe` 没有 PDB、只导出 110 个符号、没有任何 C++ 符号，所以不能像 Linux
+那样按 mangled 名解析。`satfix-win/` 用的办法是 RVA + 16 字节序言签名双重校验，
+签名不匹配就停用该目标并写日志，不盲目读写内存。
 
-把 17 个目标找出来用了四类判据，都记录在 `satfix-win/tools/gen_targets_win.py`
-的 `CONFIRMED` 表里（每条带证据）：
+17 个目标靠四类判据找出来，都记录在 `satfix-win/tools/gen_targets_win.py` 的
+`CONFIRMED` 表里，每条带证据：
 
-1. **独占字符串** —— 例如 `multiply_variable: variable %s is not set…` 唯一命中一个函数；
-2. **类型表索引常量集** —— `armor_max` 的 `0x15fec/0x15ff8/0x160a8` 三常量同现，
-   扫过 110843 个函数块**命中数 = 1**；
-3. **已确证函数的 helper 调用组合** —— 先提取 helper RVA，再找同类调用者；
-4. **NDefines 名字 thunk** —— 从 exe 的 `.rdata` 取出 `NDefines::<组>::<名字>` 字符串，
-   反汇编引用它的 thunk，`r9` 里就是该 define 的全局地址，
-   于是「名字 → 全局地址」被直接读出来，再用「谁读这个全局」定位函数。
+1. **独占字符串**，例如 `multiply_variable: variable %s is not set…` 唯一命中一个函数；
+2. **类型表索引常量集**，例如 `armor_max` 的 `0x15fec/0x15ff8/0x160a8` 三常量同现，扫过 110843 个函数块命中数为 1；
+3. **已确证函数的 helper 调用组合**，先提取 helper RVA，再找同类调用者；
+4. **NDefines 名字 thunk**，从 exe 的 `.rdata` 取出 `NDefines::<组>::<名字>` 字符串，反汇编引用它的 thunk，`r9` 里就是该 define 的全局地址。名字到全局地址的对应直接读出来了，再用谁读这个全局去定位函数。
 
-同时记录了几条**被证伪**的思路，免得后来人重走：
-- Linux 里的**立即数**指纹对 MSVC 不可移植（GCC 用立即数的地方 MSVC 常用指令）；
-- Linux 的**成员偏移**不能直接搬到 MSVC（如 `+0xb8→+0xc0`、`+0x808→+0x8b0`）；
-- 按 Linux 的**函数间距**找邻居不可靠。
+同时也记了几条被证伪的思路，免得后来人重走一遍：Linux 里的立即数指纹对 MSVC
+不可移植（GCC 用立即数的地方 MSVC 常用指令），成员偏移不能直接搬（`+0xb8→+0xc0`、
+`+0x808→+0x8b0`），按函数间距找邻居也不可靠。
 
 ## 目录结构
 
@@ -170,14 +161,14 @@ gh release create v<版本> <zip> <zip>.sha256 --notes-file <zip>.notes.md
 
 1. 标签 = `v` + `version`；
 2. 包内没有 `config\`、`logs\`（手册 §10.1）；
-3. **DLL 的构建模式** —— 默认要求 `write-back`，打出影子版会被拒；
+3. DLL 的构建模式，默认要求 `write-back`，打出影子版会被拒；
 4. `satfix-win/RELEASE_NOTES.md` 里有这个版本的那一节。
 
 发布说明的唯一来源是 [`satfix-win/RELEASE_NOTES.md`](satfix-win/RELEASE_NOTES.md)，
-脚本会抽出对应小节写成 `.notes.md`。**不要在 GitHub 网页上直接改说明** ——
-否则下次发布会被覆盖，而且没有版本记录。
+脚本会抽出对应小节写成 `.notes.md`。不要在 GitHub 网页上直接改说明，下次发布会被覆盖，
+而且没有版本记录。
 
-> **注意**：仓库里**不含**预编译的 DLL（`satfix.dll` 被 gitignore）。
+> 仓库里不含预编译的 DLL（`satfix.dll` 被 gitignore）。
 > 直接用请从 Releases 下载；自行编译需要 VS2022 BuildTools + Windows SDK。
 
 ## 合规性
@@ -199,20 +190,17 @@ gh release create v<版本> <zip> <zip>.sha256 --notes-file <zip>.notes.md
 | 9.1 | 日志写 `logs\`、运行中可读、有上限 | 见下方说明 |
 | 10.1 | 包内无 `config\`/`logs\` | `tools/check_plugin_pkg.py` 守着（23 项） |
 
-**一处有意的偏离（9.1）**：手册建议 `_wfsopen(..., _SH_DENYWR)`，实测在本机
+有一处有意偏离手册（9.1）。手册建议 `_wfsopen(..., _SH_DENYWR)`，实测本机
 `_wfopen_s` 与 `_SH_DENYWR` 都返回 `EACCES`，而 Win32 层
-`CreateFileW(GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE)` 能正常读。
-所以改用 `_wsopen_s` + 显式 `_SH_DENYNO` —— **意图相同（允许游戏运行时读日志），
-手段按实测调整**，并由 `test_load_plugin` 的可读性断言守住。
+`CreateFileW(GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE)` 能正常读。所以改用
+`_wsopen_s` + 显式 `_SH_DENYNO`，意图不变（允许游戏运行时读日志），手段按实测调整，
+并由 `test_load_plugin` 的可读性断言守住。
 
 ## 限制
 
-- 只对**已确证 RVA** 的版本生效。游戏更新后签名校验会挡下全部目标并写日志，
-  需要重新确证地址（`tools/gen_targets_win.py --check` 能报告漂移）。
-- OBSERVE 类目标**只检出、不修改** —— 它们与 Linux 侧同策略。
-  pow 链（军力指数）的等价饱和实现风险高，故意不做。
-- 正常游玩不会触发任何 EVENT：原版量级离溢出阈值差十几个数量级。
-  要看到效果需要 mod 把数值推到 ~9.2e17。
+- 只对已确证 RVA 的版本生效。游戏更新后签名校验会挡下全部目标并写日志，需要重新确证地址（`tools/gen_targets_win.py --check` 能报告漂移）。
+- OBSERVE 类目标只检出、不修改，与 Linux 侧同策略。pow 链（舰队实力）的等价饱和实现风险高，故意不做。
+- 正常游玩不会触发任何 EVENT：原版量级离溢出阈值差十几个数量级。要看到效果需要 mod 把数值推到 ~9.2e17。
 
 ## 许可
 
