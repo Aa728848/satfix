@@ -189,7 +189,14 @@ cd satfix
 | `kInputGuard` | 危险在输入域：先把输入夹到安全域再调原函数 |
 | `kObserve` | 只判定「是否进入危险域」，只记日志 |
 
-当前分布：**EXACT 7 / INPUT_GUARD 1 / OBSERVE 10**。
+当前分布：**EXACT 8 / INPUT_GUARD 1 / OBSERVE 9**（合计 18）。
+**这个数以 `src/satfix_targets_win.generated.hpp` 为准** —— 它由 `gen_targets_win.py` 生成，
+手写的文档容易写错（本文件早期版本就写成过 7/1/10）。要核对：
+
+```powershell
+Select-String -Path satfix-win\src\satfix_targets_win.generated.hpp -Pattern ', k(Exact|Observe|InputGuard),' |
+    Group-Object { $_.Line -replace '.*,\s*(k\w+),.*','$1' } | Select-Object Name,Count
+```
 
 ### 回写闸门（重要）
 
@@ -236,7 +243,74 @@ cd satfix
 
 ---
 
-## 7. 发布流程
+## 7. 必须遵守插件手册
+
+Windows 侧不是普通 DLL，是 **Stellaris Launcher 插件**，必须满足规范：
+
+> `stellaris-launcher/docs/PLUGIN_HANDBOOK.zh-CN.md`
+> （英文版 `PLUGIN_HANDBOOK.md`；本仓库上级目录的 `stellaris-launcher/` 里）
+
+**改 Windows 侧代码前，先读手册 §6（编写 DLL 的规则）与 §13（发布前检查清单）。**
+
+### 硬性要求（§6，违反会导致崩溃/卡死/被拒）
+
+| 条款 | 要求 | 本插件现状 |
+| --- | --- | --- |
+| 6.1 | `DllMain` 只创建线程；不等待、不 `LoadLibrary`、不碰引擎、不做文件/网络 | ✅ 只 `CreateThread` + `CloseHandle` |
+| 6.2 | 从**自己模块地址**取插件路径；不用 CWD、不写死 `Documents\…` | ✅ `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` |
+| 6.3 | 引擎函数只在游戏主线程调用 | ✅ detour 内只做原子写，重活推迟到主线程泵 |
+| 6.4 | 原始内存读用 SEH 包住 | ✅ `whk::safe_read` / `fast_read` |
+| 6.5 | detour 必须调原函数；不假设自己是唯一钩子；不恢复他人钩子 | ✅ `TypedHook::call()` |
+| 6.6 | **不卸载自己**（不 `FreeLibraryAndExitThread`） | ✅ 源码中无调用 |
+| 6.7 | 静态运行库 `/MT`；不弹控制台；只支持 x64 | ✅ `/MT`、无 `AllocConsole` |
+
+**6.4 还有一条容易忽略的**：手册明确说「不要依赖 Linux 版反编译里的结构偏移，
+Windows（MSVC）与 Linux（GCC）的对象布局不同」。本项目的做法是**偏移一律在 Windows
+侧重新确证**（读函数体），Linux 侧只用来**指路**，不用来抄数值。
+
+### 6.3 线程模型（最容易让游戏静默崩溃）
+
+引擎代码**只能**在游戏主线程跑。本插件的模式：
+
+- detour 里**只做原子写**（计数、置标志）
+- 真正的活（读设置、写日志、解析）推迟到「主线程泵」—— 只在游戏自己进入被 hook 函数时触发
+
+**不要**在自己的线程里调游戏函数。这条踩过坑：早期在 hook 里调
+`CShipSize::GetName()`，因为它在 `CPdxTaskScheduler` 工作线程上被调用、
+而本地化字符串池不是线程安全的 → **SEGV**。
+
+### 清单（§4 / 附录 B）
+
+`plugin/stl-plugin.json` 必须满足：
+
+- `"schema": 2`
+- `id` 合法且**与以前一致**（改 id 等于换一个插件，用户设置会丢）
+- `version` 与 tag、发布说明标题一致
+- `game.exe_timestamps` 列出所有测试过的构建（**注意它是嵌在 `game` 下的**，不是顶层）
+- `config[].default` 指向的文件必须真的在包里
+- 自动更新需要 `update.github` + `update.asset`
+
+DLL 自己也要**再校验一次** PE 时间戳与序言签名（手册 §7），不匹配就跳过该目标并写日志 ——
+这样在未列出的构建上（手动注入时）是**安全地不工作**，而不是乱读写内存。
+
+### 包与发布（§10 / §13）
+
+- zip 的内容**就是插件文件夹**；**不含** `config\`、`logs\`
+- 标签 = `v` + `version`；附件名匹配 `update.asset`；附带 `.sha256`
+- 正式发布（不是草稿、不是预发布）
+
+**自检命令**：
+
+```powershell
+python satfix-win\tools\check_plugin_pkg.py     # 校验 dist\ 是否符合手册
+```
+
+> 注意：对 `plugin\`（开发链接目录）跑这个会报 `config\`/`logs\` 存在 —— 那是正常的，
+> 该检查针对的是 `dist\` 发布目录。
+
+---
+
+## 8. 发布流程
 
 ```powershell
 cd satfix-win
@@ -249,16 +323,27 @@ cd satfix-win
 **版本号不通过参数传** —— 它从 `plugin/stl-plugin.json` 的 `version` 字段读。
 
 打包脚本会检查：
-- 当前 git tag == `v<version>`
 - 包内**不含** `config\` / `logs\`（用户私有）
+- 清单声明的 `config.default` 文件确实在包里
 - **构建模式是 `write-back`**（影子模式默认被拒；要放行得显式 `-Mode any`）
 - 从 `RELEASE_NOTES.md` 提取 `## v<version>` 段落生成 `<zip>.notes.md`
+
+**tag 要自己打**（脚本不校验，只打印出建议的 `gh release create` 命令）：
+
+```powershell
+git tag v0.2.0 && git push origin v0.2.0
+gh release create v0.2.0 satfix-v0.2.0.zip satfix-v0.2.0.zip.sha256 `
+    --title "satfix v0.2.0" --notes-file satfix-v0.2.0.zip.notes.md
+```
+
+**版本号只在 `plugin/stl-plugin.json` 的 `version` 一处定义** —— 打包、tag、发布说明的
+`## v<version>` 标题都要与它一致。
 
 发布包：`github.com/Aa728848/satfix`，asset `satfix-*.zip`。
 
 ---
 
-## 8. 反模式（出现即为错误）
+## 9. 反模式（出现即为错误）
 
 1. **不看 Linux 源码就硬猜 Windows 函数** —— 这是本项目最贵的错误来源。
 2. **靠映射表的名字当身份证明**。`win_linux_mapping_final_452.json` 的
@@ -273,7 +358,7 @@ cd satfix-win
 
 ---
 
-## 9. 快速上手
+## 10. 快速上手
 
 ```powershell
 # 1) 看当前目标清单与策略

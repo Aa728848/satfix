@@ -985,8 +985,13 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
 //      = 1.55e14 游戏单位 = 1.55e19 存储值 > INT64_MAX(9.22e18) -> wrap 成负数。
 //  用户确认：「去掉射速的 buff 肯定就正常了」。
 //
-//  OBSERVE：只观测不替换 —— 输出结构里哪个字段是面板那个「伤害」尚未确证，
-//  硬回写有写坏别的统计项的风险。判据很硬：**伤害不可能为负**。
+//  EXACT：回写。`r` 就是函数的 sret 返回槽（`return param_1`），专门用来放返回值，
+//  不是共享结构里的某个字段 —— 写它不会碰到别的统计项。
+//  实测确认它只影响面板显示、不影响战斗伤害：
+//    * 面板调度器 FUN_1411519f0 把结果写进**栈上临时槽**，然后 `return 1`（状态码）；
+//    * 调用本函数的 8 个函数全是 UI 层（工具提示 / 面板），无一是战斗函数；
+//    * 战斗伤害走 TakeDamage/DealDamage 那条完全不同的链。
+//  判据很硬：**伤害不可能为负**，负值或 > 9.2e13 游戏单位就必然是 wrap。
 constexpr long long kDamageSane = 9223372036854775807LL / 100000;  // 9.2e13 游戏单位
 /// 伤害溢出的封顶值 = int64 上界（即「92 万亿游戏单位」那个天花板）。
 constexpr long long kDamageSaturate = 9223372036854775807LL;
@@ -1039,15 +1044,26 @@ long long* detour_damage_per_day(long long* ret, const void* design, const void*
     //     *ret = 1915870600908122664   (19158706009081.23)   <- wrap，本分支命中
     if (v < 0 || v > kDamageSane) {
         g_events.fetch_add(1, std::memory_order_relaxed);
-        if (g_settings.verbose_events)
-            logf("EVENT CalcAverageDamagePerDay 伤害溢出=%lld (%.4f) -> 封顶到 %lld%s", v,
-                 static_cast<double>(v) / 1e5, (long long)kDamageSaturate,
+        // 限流：舰船详情面板**每帧**都会重算同一个设计，不限流一次点击就能刷上万行
+        // （实测 19808 行把 20000 行的日志上限打满，真信号被淹）。
+        // 与上限钩子同款做法：按「报告过的值」去重 —— 同一台船同一组加成只报一次。
+        if (g_settings.verbose_events) {
+            static std::atomic<uint64_t> last_v{0};
+            static std::atomic<int> logged{0};
+            if (logged.load(std::memory_order_relaxed) < g_settings.collapse_log_limit &&
+                last_v.exchange(static_cast<uint64_t>(v), std::memory_order_relaxed) !=
+                    static_cast<uint64_t>(v)) {
+                logged.fetch_add(1, std::memory_order_relaxed);
+                logf("EVENT CalcAverageDamagePerDay 伤害溢出=%lld (%.4f) -> 封顶到 %lld%s", v,
+                     static_cast<double>(v) / 1e5, (long long)kDamageSaturate,
 #if SATFIX_REPLACE
-                 " [已回写]"
+                     " [已回写]"
 #else
-                 " [影子模式，未改数值]"
+                     " [影子模式，未改数值]"
 #endif
-            );
+                );
+            }
+        }
 #if SATFIX_REPLACE
         g_replaced.fetch_add(1, std::memory_order_relaxed);
         *r = kDamageSaturate;
