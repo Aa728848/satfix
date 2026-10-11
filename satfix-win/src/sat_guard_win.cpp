@@ -206,10 +206,13 @@ struct Settings {
     bool     log_recompute_mismatch = false;
     /// 头 N 次上限调用打印重算链每一段的中间量（默认 12，0 = 关）。
     /// 「溢出没被抓到」时用它定位卡在哪一段。
-    int      diag_recompute_calls = 12;
-    /// 把流经 ApplyModifierMult 的护盾/装甲/船体族修正打出来（默认 40 条，0 = 关）。
-    /// 用来追「护盾加算被写成 0」这类上游污染。
-    int      diag_modifier_calls = 40;
+    /// 头 N 次上限调用打印重算链每一段的中间量（0 = 关，**默认关**）。
+    /// ⚠️ 开启会让 detour_max_hp 走完整重算（绕过快速路径），有性能代价 ——
+    /// 只在排查「为什么没抓到溢出」时短时打开。
+    int      diag_recompute_calls = 0;
+    /// 统计流经 ApplyModifierMult 的 ModifierType 直方图（0 = 关，**默认关**）。
+    /// 开启后每次调用多一次原子加 —— 那条路 463 万次调用，别常态开着。
+    int      diag_modifier_calls = 0;
     /// 「加算溢出塌成 0」事件最多写多少行（每条 design 只写一次，见 detour_max_hp）。
     /// 舰船详情面板每帧重算，不限流会一次刷满日志。
     int      collapse_log_limit = 64;
@@ -1158,19 +1161,20 @@ int64_t inline_mod_lookup(const void* mods, int type) {
     int32_t n = 0;
     const void* types = nullptr;
     const void* vals = nullptr;
-    if (!whk::safe_read(&n, m + 0x1c, sizeof n) || n <= 0) return 0;
-    if (!whk::safe_read(&types, m + 0x10, sizeof types) || types == nullptr) return 0;
-    if (!whk::safe_read(&vals, m + 0x38, sizeof vals) || vals == nullptr) return 0;
+    // 热路径：全部用 fast_read（地址来自游戏传入的 CModifier*，可信）。
+    if (!whk::fast_read(&n, m + 0x1c, sizeof n) || n <= 0) return 0;
+    if (!whk::fast_read(&types, m + 0x10, sizeof types) || types == nullptr) return 0;
+    if (!whk::fast_read(&vals, m + 0x38, sizeof vals) || vals == nullptr) return 0;
     for (int32_t i = 0; i < n; ++i) {
         int32_t t = 0;
-        if (!whk::safe_read(&t, static_cast<const char*>(types) + (size_t)i * 4, sizeof t)) return 0;
+        if (!whk::fast_read(&t, static_cast<const char*>(types) + (size_t)i * 4, sizeof t)) return 0;
         if (t != type) continue;
         int64_t v = 0;
-        if (!whk::safe_read(&v, static_cast<const char*>(vals) + (size_t)i * 0x10, sizeof v)) return 0;
+        if (!whk::fast_read(&v, static_cast<const char*>(vals) + (size_t)i * 0x10, sizeof v)) return 0;
         void* tbl = whk::image_base_plus(0x2814390u);  // ModifierType 元数据表
         if (tbl != nullptr) {
             uint32_t mask = 0;
-            if (whk::safe_read(&mask, static_cast<const char*>(tbl) + (size_t)type * 0xb0 + 0xa8,
+            if (whk::fast_read(&mask, static_cast<const char*>(tbl) + (size_t)type * 0xb0 + 0xa8,
                                sizeof mask) &&
                 ((mask >> 5) & 1u)) {
                 if (v < 0) return 0;
@@ -1186,11 +1190,11 @@ int64_t inline_mod_lookup(const void* mods, int type) {
 int64_t ship_class_mod(const void* design, const void* mods, uint32_t table_rva) {
     if (design == nullptr || table_rva == 0) return 0;
     uint8_t cls = 0;
-    if (!whk::safe_read(&cls, static_cast<const char*>(design) + kShipClassOff, sizeof cls)) return 0;
+    if (!whk::fast_read(&cls, static_cast<const char*>(design) + kShipClassOff, sizeof cls)) return 0;
     const void* table = whk::image_base_plus(table_rva);
     if (table == nullptr) return 0;
     int32_t type = 0;
-    if (!whk::safe_read(&type, static_cast<const char*>(table) + (size_t)cls * 4, sizeof type))
+    if (!whk::fast_read(&type, static_cast<const char*>(table) + (size_t)cls * 4, sizeof type))
         return 0;
     return inline_mod_lookup(mods, type);
 }
@@ -1226,7 +1230,7 @@ bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods
     }
 
     int64_t base = 0;
-    if (!whk::safe_read(&base, static_cast<const char*>(design) + r.design_off, sizeof base)) {
+    if (!whk::fast_read(&base, static_cast<const char*>(design) + r.design_off, sizeof base)) {
         if (d) d->stage = 3;
         return false;
     }
@@ -1300,6 +1304,26 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
     long long* const r = hk.call(ret, design, mods, fleet, tooltip);
 
     const long long v = (r != nullptr) ? *r : 0;
+
+    // ★★ 快速路径（性能关键）—— 必须放在**所有**逐调用开销之前
+    // ------------------------------------------------------
+    // 下面**所有**回写分支都要求 `v <= 0`：
+    //   * 「塌成 0」需要 add_in==0，而护盾/装甲的 base 恒为 0 → 游戏值必然是 0；
+    //   * 「wrap」要求 v < 0 或 v == 0。
+    // 正常舰船的 v 是正数（实测 6023399996 等），对它做重算是**纯浪费** ——
+    // 而三个上限函数各约 157 万次调用，每次重算要 4~6 次游戏函数调用
+    // （含一次虚调用）+ 扫 46 项修正表。
+    //
+    // 实测教训（2026-10-11 用户反馈「过一天的时间变长、流畅度降低」）：
+    // 就是这里。加了这条快速路径后，正常舰船只花一次比较 + 一次原子加。
+    //
+    // 诊断开启时（diag_recompute_calls > 0）不走快速路径，以便观察完整链路；
+    // 那个开关默认关闭，只在排查时短时打开。
+    const bool want_diag = g_settings.diag_recompute_calls > 0;
+    if (v > 0 && !want_diag) {
+        maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
+        return r;
+    }
 
     // 采样：留作实机核对重算是否逐位一致（不一致但没到回写阈值时尤其有用）。
     bool is_sample = false;
@@ -1579,20 +1603,21 @@ long long* detour_apply_mul(long long* ret, long long* value, const void* modifi
     game_thread_pump();
 
     int64_t v0 = 0;
-    const bool ok = whk::safe_read(&v0, value, sizeof v0);
+    const bool ok = whk::fast_read(&v0, value, sizeof v0);  // 热路径（463 万次）
 
     long long* const r = g_hook_apply_mul.call(ret, value, modifier, modifier_type, stack_flag);
 
     if (ok && r != nullptr) {
         int64_t m_eff = 0, v_game = 0;
-        whk::safe_read(&m_eff, r, sizeof m_eff);
-        whk::safe_read(&v_game, value, sizeof v_game);
+        whk::fast_read(&m_eff, r, sizeof m_eff);
+        whk::fast_read(&v_game, value, sizeof v_game);
         shadow_apply_mul("ApplyModifierMult(cfx)", v0, m_eff, v_game, false, value);
 
         // 统计每个 ModifierType 的调用次数（前 64 个类型），用来回答
         // 「护盾/装甲/船体那一族到底有没有流经这个出口」。
         // 用户那个「护盾 0」的现场里 0x2e=0 / 0x2f=1e15，
         // 如果这些 type 一次都没从这里过，就说明污染在**别的出口**。
+        // 默认关：这条路 463 万次调用，常态开着每次都要多一次原子加。
         if (g_settings.diag_modifier_calls > 0 && modifier_type >= 0 && modifier_type < 64) {
             g_type_hits[modifier_type].fetch_add(1, std::memory_order_relaxed);
         }
@@ -1610,15 +1635,15 @@ long long* detour_apply_mul_fp15(long long* ret, long long* fp15_value, const vo
     game_thread_pump();
 
     int64_t v0 = 0;
-    const bool ok = whk::safe_read(&v0, fp15_value, sizeof v0);
+    const bool ok = whk::fast_read(&v0, fp15_value, sizeof v0);  // 热路径
 
     long long* const r =
         g_hook_apply_mul_fp15.call(ret, fp15_value, modifier, modifier_type, stack_flag);
 
     if (ok && r != nullptr) {
         int64_t m_eff = 0, v_game = 0;
-        whk::safe_read(&m_eff, r, sizeof m_eff);
-        whk::safe_read(&v_game, fp15_value, sizeof v_game);
+        whk::fast_read(&m_eff, r, sizeof m_eff);
+        whk::fast_read(&v_game, fp15_value, sizeof v_game);
         shadow_apply_mul("ApplyModifierMult(fp15)", v0, m_eff, v_game, true, fp15_value);
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));

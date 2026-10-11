@@ -131,6 +131,24 @@ inline bool safe_read(void* dst, const void* src, size_t n) {
   return true;
 }
 
+/// @brief **热路径专用**读：不做 VirtualQuery，只用 SEH 兜住坏指针。
+///
+/// 为什么需要它：`safe_read` 每次调用都做一次 `VirtualQuery`（内核态切换）。
+/// 在 hook 的热路径上（上限函数每次调用要读十几处）这会放大成千万级的内核调用 ——
+/// 实测：三个上限函数各约 157 万次调用 × 每次 ~15 次读 ≈ 2400 万次 VirtualQuery，
+/// 直接把游戏拖卡。SEH 的开销只在**真的异常**时才发生，正常路径下几乎为零。
+///
+/// **只用于「地址来自游戏自己传入的指针」**这种已经可信的场合。
+/// 任何来自我们解析出来的 RVA / 猜测的偏移，仍然必须走 `safe_read`。
+inline bool fast_read(void* dst, const void* src, size_t n) {
+  __try {
+    std::memcpy(dst, src, n);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
 /// @brief 目标地址是否落在本进程的一个已提交页里（用于过滤坏 RVA）。
 inline bool is_mapped(uintptr_t addr) {
   MEMORY_BASIC_INFORMATION mbi{};
