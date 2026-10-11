@@ -5,7 +5,7 @@
 //  文件大小   : 44948088 字节
 //  PE TimeDateStamp : 0x6ABEAA3F
 //  ImageBase  : 0x140000000
-//  生成时间   : 2026-10-10 15:42:44
+//  生成时间   : 2026-10-11 19:22:03
 //  确证目标   : 17/18（另有 1 个尚未定位）
 //
 //  与 Linux 侧的根本差别
@@ -77,6 +77,8 @@ inline const uint8_t kSig_access_var_pointer[SATFIX_WIN_SIG_LEN] = { 0x48, 0x8b,
 inline const uint8_t kSig_cvars_get[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55 };
 inline const uint8_t kSig_cvars_set[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x4c, 0x89, 0x44, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x40, 0x48 };
 inline const uint8_t kSig_cfp_getvalue[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x81, 0xec, 0xa0, 0x01, 0x00, 0x00, 0x4d, 0x8b, 0xd0 };
+inline const uint8_t kSig_ship_size_of[SATFIX_WIN_SIG_LEN] = { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x01, 0x48, 0x8b, 0xd9, 0xff, 0x50, 0x10, 0x48 };
+inline const uint8_t kSig_modifier_value[SATFIX_WIN_SIG_LEN] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48 };
 
 inline const Target kTargets[] = {
     {"cfx_get_rounded", "CFixedPoint::GetRounded() const  /  GetRounded64() const", 0x01b4c170u, kSig_cfx_get_rounded, kExact, "win dump FUN_141b4c170（17 行）：lVar1=*p1; lVar2=lVar1-50000; if(-1<lVar1) lVar2=lVar1+50000; return lVar2/100000; 与 Linux 的 CFixedPoint::GetRounded/GetRounded64（反编译 8599412/8599430，两函数体**完全相同**）逐字一致。MSVC 的 COMDAT 折叠把这两个相同函数合并成了一份，所以只有一个地址 —— 这与「脚本里查 GetRounded 得 0 命中、GetRounded 形状的孪生只有 1 个」互相印证。已实测溢出：INT64_MAX -> 游戏得 -92233720368547，饱和版 +92233720368547。"},
@@ -121,6 +123,8 @@ inline const Helper kHelpers[] = {
     {"cvars_get", "CVariables::GetVariable(CString const&) const", 0x00227390u, kSig_cvars_get, "从 var_multiply 的调用点读出（实参是 vars+8，所以它接的是 CVariables 的哈希表头）。体内 FUN_141b430e0(0, name, len) 算哈希，`(uVar3 & uVar5)*0x40 + *(param_1+8)` 定位桶，再 memcmp 比名字；**返回条目指针**，条目 +0x38 就是 CFixedPoint 值。调用方读 `*(longlong *)(entry + 0x38)` —— 这一条直接给出了变量值的存放偏移。ABI：longlong* fn(vars, out_slot, name)，返回 out_slot。"},
     {"cvars_set", "CVariables::SetVariable(CString const&, CFixedPoint)", 0x007aae10u, kSig_cvars_set, "从 var_multiply 的调用点读出。体内 FUN_1407ab940(vars+8, &entry, hash, name, &value)，当 `local_10 == '\\0'`（条目已存在）时写 `*(entry + 0x38) = value` —— 与 cvars_get 的读偏移 0x38 **互为印证**。ABI：void fn(vars, name, value)。"},
     {"cfp_getvalue", "CFixedPointVariableValue::GetValue(CEventScope&) const", 0x0034d500u, kSig_cfp_getvalue, "从 var_multiply 的调用点读出（实参是 this+0xf0，MSVC 把该值成员排在 0xf0；Linux 是 0xe8）。体内按变量值类型分派后把 CFixedPoint 写进 out 槽。ABI：longlong* fn(this+0xf0, out_slot, scope)，返回 out_slot。"},
+    {"ship_size_of", "CShipSize* —— 从 CBaseDesignImplementation 取当前成长阶段的船体尺寸", 0x0030e990u, kSig_ship_size_of, "**护盾/装甲/船体上限做忠实重算的前提。**三个上限函数体内都是 `lVar9 = FUN_14030e990(param_2)` 然后把这个返回值当 CShipSize 传给 GetModifierValue —— 所以它就是 Linux 的 `stage = GetCurrentGrowthStage(design); size = *(stage + 8)` 两步的合并体：体内 `lVar2 = (**(code**)(*param_1 + 0x10))()` 虚调用拿阶段对象，再按 `*(param_1 + 0x52c)` 这个成长阶段下标从 `*(lVar2 + 0x20)` 的 0x110 步长数组里取（越界则回落到第 0 个），取出的 `+8` 字段就是 CShipSize。注意它同时覆盖了 Linux 的 GetCurrentGrowthStage + 解引用，**不需要**再单独定位后者。ABI：void* fn(const void* design) —— 单参数，返回值在 rax。"},
+    {"modifier_value", "CShipSize::GetModifierValue(CModifier const&, ModifierType) const", 0x00d29dd0u, kSig_modifier_value, "**重算链的取值原语。**三个上限函数体内反复出现 `FUN_140d29dd0(size, &out, mods, type)`，type 就是 ModifierType （hull 0x1e/0x1f、shield 0x2e/0x2f、armor 0x24/0x25）。体内：按 `*(mods + 0x1c)` 的条目数线性扫 `*(mods + 0x10)` 的 type 数组，命中后取 `*(mods + 0x38) + i*0x10` 的值；若该 type 的位掩码 `(*(DAT_142814390 + type*0xb0 + 0xa8) >> 5 & 1)` 置位，则把结果夹进 [0, 100000]（负数→0，>1.0→1.0）；随后再对 `FUN_140d2c080(size, type)` 查一次「该尺寸的同类修正」并**相加**，写进 `*param_2` 返回。**与 Linux 的差异**：Linux 版是 3 参数返回值在 rax，Windows 是 4 参数 sret （第 2 参数是 out 槽）—— 按 Windows 机器码定签名，不照抄 Linux。ABI：longlong* fn(const void* size /*rcx*/, longlong* out /*rdx*/, const void* mods /*r8*/, int type /*r9d*/)，返回 out。"},
 };
 
 inline constexpr int kHelperCount = sizeof(kHelpers) / sizeof(kHelpers[0]);

@@ -70,7 +70,7 @@ const char* const kBuildMode =
 #ifndef SATFIX_MAX_LOGS
 // 500 行在开心跳时会不够用（实测：20000 次调用一块，几十秒就写满）。
 // 提到 4000：既能容纳一整局的心跳，也不会让日志无限增长。
-#define SATFIX_MAX_LOGS 4000
+#define SATFIX_MAX_LOGS 20000
 #endif
 
 namespace {
@@ -182,13 +182,31 @@ struct Settings {
     bool     heartbeat = false;         ///< 周期性汇总
     uint64_t heartbeat_every = 200000;
     bool     verbose_events = true;     ///< 打印每条 EVENT
-    /// 护盾/装甲/船体上限的「合理上限」，单位是 CFixedPoint 存储值（1e5 = 1 游戏单位）。
-    /// 默认 1e11 = 100 万游戏单位 —— 远高于任何正常舰船，只用来兜住溢出后的荒谬值。
-    int64_t  max_hp_cap = 100000000000LL;
+    /// 护盾/装甲/船体上限的「荒谬上限」，单位是 CFixedPoint 存储值（1e5 = 1 游戏单位）。
+    ///
+    /// **实测教训**：原本设 1e11（= 100 万游戏单位），结果在装了 mod 的存档里刷出
+    /// 3927 条假 EVENT —— mod 的护盾正常就有 100 亿（1e10）游戏单位，远超那个阈值。
+    /// 阈值定低了不是「多报几条」，是**把真问题淹掉**。
+    ///
+    /// 现在默认 1e18 存储值（= 1e13 游戏单位），已经贴近 int64 上限（9.22e18 存储值），
+    /// 所以实际上**只靠 v < 0 那条判据**：int64 的正数乘法溢出必然 wrap 成负数，
+    /// 而「大正数」在 mod 存档里是合法的。保留这个上界只是兜住极端荒谬值。
+    int64_t  max_hp_cap = 1000000000000000000LL;
     /// 变量系统（var_add / var_multiply）做影子复算：要读回变量当前值，
     /// 依赖 4 个辅助函数的 RVA 解析成功。解析不到时自动退化成只计数。
     /// 这是 EXACT 路径，比其它目标多几次间接调用，出问题可以一键关掉。
     bool     verify_variables = true;
+    /// 护盾/装甲/船体上限做忠实重算（等值比对 + 溢出回写饱和值）。
+    /// 依赖 ship_size_of / modifier_value 两个辅助函数解析成功；
+    /// 解析不到时自动退化成「只认负数」。同样可以一键关掉。
+    bool     verify_max_hp = true;
+    /// 把「重算≠游戏但未达回写阈值」也写进日志（诊断用，默认关）。
+    /// 实测船体上限会系统性不等（算式里还有一段条件性累加未建模），
+    /// 开着会刷满日志；只在排查重算本身时才打开。
+    bool     log_recompute_mismatch = false;
+    /// 头 N 次上限调用打印重算链每一段的中间量（默认 12，0 = 关）。
+    /// 「溢出没被抓到」时用它定位卡在哪一段。
+    int      diag_recompute_calls = 12;
 };
 
 std::wstring config_path() { return plugin_dir() + L"config\\satfix.ini"; }
@@ -232,6 +250,10 @@ Settings read_settings(bool* found) {
         else if (key == "heartbeat_every") s.heartbeat_every = _strtoui64(val.c_str(), nullptr, 10);
         else if (key == "verbose_events") s.verbose_events = is_true(val);
         else if (key == "verify_variables") s.verify_variables = is_true(val);
+        else if (key == "verify_max_hp") s.verify_max_hp = is_true(val);
+        else if (key == "log_recompute_mismatch") s.log_recompute_mismatch = is_true(val);
+        else if (key == "diag_recompute_calls")
+            s.diag_recompute_calls = (int)_strtoi64(val.c_str(), nullptr, 10);
         else if (key == "max_hp_cap") {
             const long long v = _strtoi64(val.c_str(), nullptr, 10);
             if (v > 0) s.max_hp_cap = v;
@@ -913,6 +935,7 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
     long long* const r = g_hook_diplo_weight.call(self, ret, group);
 
     const long long v = (r != nullptr) ? *r : 0;
+
     if (v < 0 || v > kDiploWeightSane) {
         g_events.fetch_add(1, std::memory_order_relaxed);
         if (g_settings.verbose_events)
@@ -931,20 +954,192 @@ long long* detour_diplo_weight(const void* self, long long* ret, const void* gro
 //                    const void* tooltip /*栈*/)
 //  体内以 `*param_1 = ...` 写返回值并 `return param_1` —— 与 Atan2 同样的 sret 形态。
 //
-//  OBSERVE：上限 = 船体尺寸基础值 × 一连串乘法修正，其中大量乘法被**内联**，
-//  现有的 ApplyModifierMult 钩子抓不到，所以补这三个观测点。
-//  判据（Linux 侧同）：正常上限一定 ≥ 0 且不会离谱；负数或量级异常 = 几乎必然是 wrap。
-//  用 max_hp_cap 兜住，避免正常的大数值被误报。
+//  ★ 为什么原来只能 OBSERVE，现在能做 EXACT
+//  ---------------------------------------
+//  上限 = 船体尺寸基础值 × 一连串乘法修正，其中大量乘法被**内联**，
+//  现有的 ApplyModifierMult 钩子抓不到 —— 这是 Linux 侧把它列为 OBSERVE 的原因。
+//  但读 Windows 函数体发现：那条算式**没有内联到无法复算的程度**，
+//  它是由几个可独立调用的原语拼出来的（都是游戏自己的函数，见 HELPERS）：
+//
+//      size   = ship_size_of(design)                 // CShipSize
+//      base   = *(design + <off>)                    // off: hull 0x10 / shield 0x130 / armor 0x70
+//      base  += modifier_value(size, mods, type_a)   // type_a: hull 0x1e / shield 0x2e / armor 0x24
+//      add    = modifier_value(size, mods, type_b)   // type_b: hull 0x1f / shield 0x2f / armor 0x25
+//      factor = add + 100000                         // ← ★ 游戏在这里自己兜底
+//      if (factor < 0) factor = 0
+//      result = base * factor / 100000               // 走「安全域判定 + 拆分回退」
+//
+//  **「为什么溢出后是 0」的确切答案就在这里**：`add + 100000` 溢出 wrap 成负数后，
+//  游戏把 factor 夹成 0，于是 result = base × 0 / 100000 = 0。
+//  也就是说 0 **不是**我们算出来的，是游戏自己算出来的；Linux 的设计正是要在
+//  这一步 `return sat`（返回数学上正确的饱和值），而 Windows 侧此前只是"看着它变成 0"。
+//
+//  ★ 判据：等值比对（与 Linux 完全同构）
+//  ------------------------------------
+//  用饱和算术重算一遍，与游戏写回的值比：
+//    - 相等  -> 没有溢出，什么都不做（这是绝大多数情况）
+//    - 不等  -> 原版那一步 wrap 了
+//  好处：误差不放大。重算若差 1 ULP，只会把那台船改 1 ULP。
+//
+//  ★ 写回额外加一道闸：必须「不等」**且**「游戏值呈现 wrap 特征」
+//  -----------------------------------------------------------
+//  重算漏了船级修正（0x1c8/0x1c9 等，条件性生效）时，"不等"也可能来自我们的遗漏
+//  而不是游戏的溢出。所以只在**游戏值本身就是 wrap 产物**（负数，或 0 而重算为正）
+//  时才回写。漏项只会让重算值偏小，而偏小的一侧不会把正常值判成溢出 —— 方向安全。
 using FnMaxHp = long long* (*)(long long* ret, const void* design, const void* mods,
                                const void* fleet, const void* tooltip);
+
+/// 重算链的两个原语（只解析地址、不装钩子，见 HELPERS）。
+using FnShipSizeOf    = void* (*)(const void* design);
+using FnModifierValue = long long* (*)(const void* size, long long* out, const void* mods,
+                                       int type);
+
+/// 三个上限函数各自的「配方」—— 常量全部由**读函数体**得出，不是照抄 Linux。
+/// （巧合的是偏移与 ModifierType 都与 Linux 一致，但那是核对出来的结论，不是假设。）
+///
+/// `type_class_base` / `type_class_mul` 是**条件性**船级修正：
+/// 游戏在 `(fleet 虚调用 != 0) && FUN_140c67d40(fleet) < 2` 成立时才加
+/// （护盾 L228-233）。那个条件依赖 CFleet 的虚表与一个尚未逆清的函数，
+/// 所以这里**乐观地总是加上**，再由写回闸（见 detour_max_hp）挡住可能的误判。
+struct MaxHpRecipe {
+    int64_t design_off;       ///< design 里基础值的偏移
+    int     type_add;         ///< 加算修正的 ModifierType
+    int     type_mul;         ///< 乘算修正的 ModifierType
+    int     type_class_base;  ///< 船级修正（加到 base），0 = 未建模
+    int     type_class_mul;   ///< 船级修正（加到 add），0 = 未建模
+};
+
+constexpr MaxHpRecipe kRecipeShield = {0x130, 0x2e, 0x2f, 0x1c8, 0x1c9};
+constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x24, 0x25, 0x1c6, 0x1c7};
+// 船体的船级修正在体里是 0x1ca/0x1ed/0x1ee 一簇条件分支，触发条件
+// （虚调用 + FUN_140c67d40 < 2）尚未逆清，所以不建模 —— 只做 base×factor 主链。
+constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x1e, 0x1f, 0, 0};
+
+/// 用游戏自己的原语饱和重算上限。成功返回 true 并把结果写进 `*out`。
+/// 任一原语没解析到（辅助函数签名校验失败）就返回 false，调用方退化成「只认负数」。
+///
+/// `base_raw_out` 回传**未加任何修正**的 design 原始值：写回闸用它区分
+/// 「这船本来就没护盾（base==0）」与「base 有值但 factor 被夹成了 0」。
+/// 把 CModifier 的 (type, value) 表转成一行日志。
+/// 布局由 FUN_140d29dd0 确证：条目数在 +0x1c，type 数组在 +0x10（int32，步长 4），
+/// 值数组在 +0x38（int64，步长 0x10）。
+void dump_mods(const void* mods, char* buf, size_t cap) {
+    size_t off = 0;
+    off += (size_t)snprintf(buf + off, cap - off, " mods[");
+    if (mods != nullptr) {
+        const char* m = static_cast<const char*>(mods);
+        int32_t n = 0;
+        const void* types = nullptr;
+        const void* vals = nullptr;
+        if (whk::safe_read(&n, m + 0x1c, sizeof n) && whk::safe_read(&types, m + 0x10, sizeof types) &&
+            whk::safe_read(&vals, m + 0x38, sizeof vals) && types != nullptr && vals != nullptr) {
+            if (n > 64) n = 64;
+            for (int32_t i = 0; i < n && off + 32 < cap; ++i) {
+                int32_t t = 0;
+                int64_t v = 0;
+                if (!whk::safe_read(&t, static_cast<const char*>(types) + (size_t)i * 4, sizeof t))
+                    break;
+                if (!whk::safe_read(&v, static_cast<const char*>(vals) + (size_t)i * 0x10, sizeof v))
+                    break;
+                off += (size_t)snprintf(buf + off, cap - off, "%s%x=%lld", i ? " " : "", t,
+                                        (long long)v);
+            }
+        }
+        off += (size_t)snprintf(buf + off, cap - off, "] n=%d", n);
+    } else {
+        off += (size_t)snprintf(buf + off, cap - off, "null]");
+    }
+}
+
+/// 重算的中间量，用于诊断「为什么没报」。
+/// stage: 0=未开始 1=helper 缺失 2=size 为空 3=读 base 失败 4=modifier 返回空
+///        5=完成 6=factor<=0（真值为负，按 Linux 同款跳过）
+struct MaxHpDetail {
+    int     stage = 0;
+    int64_t base_raw = 0, add_in = 0, add_mul = 0, cls_base = 0, cls_mul = 0;
+    int64_t factor = 0, sat = 0;
+};
+
+bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods, int64_t* out,
+                      MaxHpDetail* d) {
+    if (d != nullptr) *d = MaxHpDetail{};
+    auto ship_size_of = reinterpret_cast<FnShipSizeOf>(helper_addr("ship_size_of"));
+    auto get_modifier = reinterpret_cast<FnModifierValue>(helper_addr("modifier_value"));
+    if (ship_size_of == nullptr || get_modifier == nullptr) {
+        if (d) d->stage = 1;
+        return false;
+    }
+    if (design == nullptr || mods == nullptr || out == nullptr) {
+        if (d) d->stage = 1;
+        return false;
+    }
+
+    void* size = ship_size_of(design);
+    if (size == nullptr) {
+        if (d) d->stage = 2;
+        return false;
+    }
+
+    int64_t base = 0;
+    if (!whk::safe_read(&base, static_cast<const char*>(design) + r.design_off, sizeof base)) {
+        if (d) d->stage = 3;
+        return false;
+    }
+    if (d) d->base_raw = base;
+
+    int64_t v = 0;
+    if (get_modifier(size, &v, mods, r.type_add) == nullptr) {
+        if (d) d->stage = 4;
+        return false;
+    }
+    if (d) d->add_in = v;
+    base = add_sat(base, v);
+
+    int64_t add = 0;
+    if (get_modifier(size, &add, mods, r.type_mul) == nullptr) {
+        if (d) d->stage = 4;
+        return false;
+    }
+    if (d) d->add_mul = add;
+
+    // 船级修正：游戏用的是**同一个** modifier_value 原语（护盾 L230-233），
+    // 所以这里直接复用，不要自己重写查表（重写会漏掉它内部的 d2c080 相加项）。
+    if (r.type_class_base != 0) {
+        int64_t c = 0;
+        if (get_modifier(size, &c, mods, r.type_class_base) != nullptr) {
+            if (d) d->cls_base = c;
+            base = add_sat(base, c);
+        }
+    }
+    if (r.type_class_mul != 0) {
+        int64_t c = 0;
+        if (get_modifier(size, &c, mods, r.type_class_mul) != nullptr) {
+            if (d) d->cls_mul = c;
+            add = add_sat(add, c);
+        }
+    }
+
+    const int64_t factor = add_sat(add, cfx::kOne);
+    if (d) d->factor = factor;
+    if (factor <= 0) {  // 真值非正 —— Linux 侧同款跳过（`if (factor > 0)`）
+        if (d) d->stage = 6;
+        return false;
+    }
+    *out = cfx::mul(base, factor);
+    if (d) {
+        d->sat = *out;
+        d->stage = 5;
+    }
+    return true;
+}
 
 whk::TypedHook<FnMaxHp> g_hook_shield_max;
 whk::TypedHook<FnMaxHp> g_hook_armor_max;
 whk::TypedHook<FnMaxHp> g_hook_hull_max;
 
-long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk, long long* ret,
-                         const void* design, const void* mods, const void* fleet,
-                         const void* tooltip) {
+long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
+                         const MaxHpRecipe& recipe, long long* ret, const void* design,
+                         const void* mods, const void* fleet, const void* tooltip) {
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
     note_first_call(idx);
@@ -952,11 +1147,117 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
     long long* const r = hk.call(ret, design, mods, fleet, tooltip);
 
     const long long v = (r != nullptr) ? *r : 0;
-    if (v < 0 || v > g_settings.max_hp_cap) {
+
+    // 采样：留作实机核对重算是否逐位一致（不一致但没到回写阈值时尤其有用）。
+    bool is_sample = false;
+    {
+        static std::atomic<uint64_t> n{0};
+        const uint64_t c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c == 500 || c == 5000 || c == 50000 || c == 200000) {
+            is_sample = true;
+            logf("SAMPLE#%llu %s 上限 = %lld (%.4f)", (unsigned long long)c, name,
+                 (long long)v, static_cast<double>(v) / 1e5);
+        }
+    }
+
+    int64_t sat = 0;
+    MaxHpDetail d;
+    const bool ok = g_settings.verify_max_hp && recompute_max_hp(recipe, design, mods, &sat, &d);
+
+    // 诊断：把重算链的每一段打出来。「溢出没被抓到」时这是唯一能定位卡在哪一段的证据。
+    //   ⚠️ 只看头 N 次调用是**没用**的：开局那批是数据库加载，design/mods 都是假指针
+    //      （实测 mods = 0x7FEFF0，栈地址），全读 0。所以改成只在两种有意义的点打印：
+    //        * 采样点（与 SAMPLE 同一批，已知有真实值）
+    //        * 前 N 次「游戏值非 0」的调用（= 真在设计舰船）
+    if (g_settings.diag_recompute_calls > 0) {
+        static std::atomic<int> shown_nonzero{0};
+        const bool want_nonzero =
+            (v != 0) && (shown_nonzero.fetch_add(1, std::memory_order_relaxed) <
+                         g_settings.diag_recompute_calls);
+        if (is_sample || want_nonzero) {
+            char mbuf[1400];
+            dump_mods(mods, mbuf, sizeof mbuf);
+            logf("DIAG %s 游戏=%lld design=%p stage=%d base=%lld add_in=%lld "
+                 "add_mul=%lld cls_b=%lld cls_m=%lld factor=%lld sat=%lld%s",
+                 name, (long long)v, const_cast<void*>(design), d.stage,
+                 (long long)d.base_raw, (long long)d.add_in, (long long)d.add_mul,
+                 (long long)d.cls_base, (long long)d.cls_mul, (long long)d.factor, (long long)d.sat,
+                 mbuf);
+        }
+    }
+
+    // 「护盾 0」这类症状的专用诊断：**游戏算出 0，但倍率巨大**。
+    // 这说明不是这个函数算错了（重算与游戏一致，都得出 0），
+    // 而是**输入本身已经是坏的** —— 基础值在上游就被写成了 0。
+    // 记下整张修正表，用来反查是哪个修正把它堆到那么大。
+    if (g_settings.diag_recompute_calls > 0 && v == 0 && d.stage == 5 &&
+        d.factor > 1000000) {  // 倍率 > 10 倍才记，正常舰船远低于此
+        static std::atomic<int> shown_zero{0};
+        if (shown_zero.fetch_add(1, std::memory_order_relaxed) < 8) {
+            char mbuf[1400];
+            dump_mods(mods, mbuf, sizeof mbuf);
+            logf("ZERO %s 游戏=0 但倍率=%lld（%.2f 倍）base=0 design=%p%s", name,
+                 (long long)d.factor, static_cast<double>(d.factor) / 1e5,
+                 const_cast<void*>(design), mbuf);
+        }
+    }
+
+    if (ok) {
+        if (sat != v) {
+            // 重算与游戏不一致。只在**游戏值本身呈现 wrap 特征**时才认定溢出：
+            //   * v < 0            —— 上限不可能为负，铁证
+            //   * v == 0 && base_raw > 0 && sat > 0
+            //                      —— 就是那个「add+1.0 溢出 → factor 被夹成 0 → 结果 0」
+            //                         的现场。要求 base_raw > 0 是为了排除「这船本来
+            //                         就没有护盾」的正常 0，那种情况不该报。
+            // 其余的不一致（重算与游戏分叉但游戏值看着正常）只记不罚，
+            // 避免把正常值改坏 —— 宁可漏报，不可误改。
+            const bool wrapped = (v < 0) || (v == 0 && d.base_raw > 0 && sat > 0);
+            if (wrapped) {
+                g_events.fetch_add(1, std::memory_order_relaxed);
+                if (g_settings.verbose_events)
+                    logf("EVENT %s 上限溢出 游戏=%lld (%.4f) 饱和=%lld (%.4f) "
+                         "design_base=%lld%s",
+                         name, (long long)v, static_cast<double>(v) / 1e5, (long long)sat,
+                         static_cast<double>(sat) / 1e5, (long long)d.base_raw,
+#if SATFIX_REPLACE
+                         " [已回写]"
+#else
+                         " [影子模式，未改数值]"
+#endif
+                    );
+#if SATFIX_REPLACE
+                if (r != nullptr) {
+                    g_replaced.fetch_add(1, std::memory_order_relaxed);
+                    *r = sat;
+                }
+#endif
+            } else if (g_settings.log_recompute_mismatch) {
+                // 诊断用，默认关闭：实测船体上限的重算会与游戏系统性不等
+                // （它的算式里还有一段条件性累加循环尚未建模），
+                // 每次调用都记会把 4000 行的日志刷满、把真信号淹掉。
+                logf("NOTE %s 重算≠游戏但未达回写阈值 游戏=%lld 重算=%lld design_base=%lld",
+                     name, (long long)v, (long long)sat, (long long)d.base_raw);
+            }
+        }
+    } else if (v < 0) {
+        // 退化路径（重算原语没解析到）：只认「结果为负」这条硬判据，与 Linux 同。
         g_events.fetch_add(1, std::memory_order_relaxed);
         if (g_settings.verbose_events)
-            logf("EVENT %s 上限 = %lld (%.4f) —— 应为非负且 <= %lld，疑似 wrap", name,
-                 (long long)v, static_cast<double>(v) / 1e5, (long long)g_settings.max_hp_cap);
+            logf("EVENT %s 上限为负 %lld (%.4f) -> 置零%s", name, (long long)v,
+                 static_cast<double>(v) / 1e5,
+#if SATFIX_REPLACE
+                 ""
+#else
+                 "（影子模式，未改数值）"
+#endif
+            );
+#if SATFIX_REPLACE
+        if (r != nullptr) {
+            g_replaced.fetch_add(1, std::memory_order_relaxed);
+            *r = 0;
+        }
+#endif
     }
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
     return r;
@@ -964,20 +1265,20 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
 
 long long* detour_shield_max(long long* ret, const void* design, const void* mods,
                              const void* fleet, const void* tooltip) {
-    return detour_max_hp("CalcMaxShieldHitPoints", kIdxShieldMax, g_hook_shield_max, ret, design,
-                         mods, fleet, tooltip);
+    return detour_max_hp("CalcMaxShieldHitPoints", kIdxShieldMax, g_hook_shield_max, kRecipeShield,
+                         ret, design, mods, fleet, tooltip);
 }
 
 long long* detour_armor_max(long long* ret, const void* design, const void* mods,
                             const void* fleet, const void* tooltip) {
-    return detour_max_hp("CalcMaxArmorHitPoints", kIdxArmorMax, g_hook_armor_max, ret, design, mods,
-                         fleet, tooltip);
+    return detour_max_hp("CalcMaxArmorHitPoints", kIdxArmorMax, g_hook_armor_max, kRecipeArmor, ret,
+                         design, mods, fleet, tooltip);
 }
 
 long long* detour_hull_max(long long* ret, const void* design, const void* mods, const void* fleet,
                            const void* tooltip) {
-    return detour_max_hp("CalcMaxHitPoints", kIdxHullMax, g_hook_hull_max, ret, design, mods, fleet,
-                         tooltip);
+    return detour_max_hp("CalcMaxHitPoints", kIdxHullMax, g_hook_hull_max, kRecipeHull, ret, design,
+                         mods, fleet, tooltip);
 }
 
 //  7) CModifier::ApplyModifierMult —— 数值放大的主出口，EXACT
