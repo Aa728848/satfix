@@ -149,7 +149,7 @@ EVENT CalcMaxShieldHitPoints 加算溢出塌成 0（倍率=1000000000100000 = 10
 * Windows hook 引擎可用：合成机器码自测 25/25 通过（rel8 加宽、线程挂起式补丁、卸载后可重装、坏目标拒绝）。
 * 定点饱和算术与 Linux 版语义一致：离线对拍 58/58 通过。
 * 判定逻辑在真进程里自检通过：14 组向量表在游戏进程内跑，日志 `判定逻辑自检：全部通过`。
-* **18 个目标**全部装上，且全部确认真被游戏代码调用（`共装上 18/18 个钩子（跳过 0）`）；
+* **19 个目标**全部装上，且全部确认真被游戏代码调用（`共装上 19/19 个钩子（跳过 0）`）；
   6 个辅助函数签名校验 `6/6`；启动日志另报 `未定位 1`（已判定 Windows 侧无对应代码，非缺口）。
 * `REPLACE=1` 回写路径也实机跑过（0.5），且这一轮拿到了**真实 EVENT**（不再只是「不崩」）。
 * 一局后期 mod 存档的实测统计见 `EVIDENCE_live_gameplay.txt`（0.1 那轮，十七目标构建）：
@@ -204,9 +204,9 @@ EVENT CalcMaxShieldHitPoints 加算溢出塌成 0（倍率=1000000000100000 = 10
   `CalcAverageDamagePerDay 伤害溢出 -> 封顶`（见 0.0 变化 2、变化 3）。日志上限 20000 行，
   事件按 design 指针限流（面板每帧都会重算同一个 design）。
 
-### 0.1 十八个目标与它们的实机证据
+### 0.1 目标清单与它们的实机证据
 
-策略分布：**EXACT 8 / INPUT_GUARD 1 / OBSERVE 9**（以 `src/satfix_targets_win.generated.hpp` 为准）。
+策略分布：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**（以 `src/satfix_targets_win.generated.hpp` 为准）。
 另有 6 个辅助函数只解析地址、不装钩子；未定位 1 个（`cfx_safe_sqrt_int`，已判定 Windows 侧无对应代码）。
 
 | 目标 | RVA | 策略 | 实机验到的 |
@@ -228,7 +228,8 @@ EVENT CalcMaxShieldHitPoints 加算溢出塌成 0（倍率=1000000000100000 = 10
 | `diplo_weight` | `0x838670` | OBSERVE | 实测 39 万次（用户实测最易溢出的那个） |
 | `mpe15` | `0xA0A4A0` | OBSERVE | 实测 162 万次（fp15 舰队实力指数） |
 | `mpe7` | `0xA0A610` | OBSERVE | 实测 156 万次（fp7 舰队实力指数） |
-| `damage_per_day` | `0xA14C60` | **EXACT** | **本轮新增的第 18 个目标**；面板「伤害」负值 -> 封顶（0.0 变化 3） |
+| `damage_per_day` | `0xA14C60` | **EXACT** | **第 18 个目标**；面板「伤害」负值 -> 封顶（0.0 变化 3） |
+| `ship_size_max_hp` | `0xD2B6E0` | **EXACT** | **第 19 个目标**；`max_hitpoints` **源头**负值 -> 封顶（0.1.16）。偏移 0x6b8 由静态推导 + 活体探针双证，**不是** Linux 的 0x678。溢出侧已用专门测试 mod 实测（`-84467440737095.51` -> `92233720368547.75`） |
 
 > 6 个辅助函数（只解析地址、不装钩子）：`access_var_pointer` `0x9F7DF0`、
 > `cvars_get` `0x227390`、`cvars_set` `0x7AAE10`、`cfp_getvalue` `0x34D500`（变量系统用）；
@@ -449,7 +450,7 @@ jmp <注册函数>
 ### 0.1.11 收尾核查：三个缺口的真假 + 回写路径的端到端 A/B 证明
 
 逐条核对 Linux 的 24 项与 Windows 的 21 项（Linux 表里第一项 `key` 是宏占位，不是目标）。
-**这是 0.1 那一轮的数字**（当时 17 个目标 + 4 个辅助函数）；当前是 **18 个目标 + 6 个辅助函数**，
+**这是 0.1 那一轮的数字**（当时 17 个目标 + 4 个辅助函数）；当前是 **19 个目标 + 6 个辅助函数**，
 新增的 `damage_per_day` 与两个上限重算辅助函数见 0.0。
 Linux 有、Windows 无的只有两个：
 
@@ -518,7 +519,7 @@ A/B 实测（同一构建脚本，只差 `-Replace` 开关）：
 #### 策略分布与 Linux 对齐
 
 > ⚠️ 下面这张表是 **0.1 那一轮**的快照（当时 17 个目标），**已经不是当前状态**。
-> 当前策略分布见 0.1 开头：**EXACT 8 / INPUT_GUARD 1 / OBSERVE 9**。
+> 当前策略分布见 0.1 开头：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**。
 > 两处变化：三个上限函数从 OBSERVE 升到 EXACT（0.1.12）、新增 `damage_per_day`（EXACT，0.1.14）；
 > 而 `var_add` / `var_multiply` 从 EXACT **降回** OBSERVE（0.1.4 的更正）。
 > 本表保留原样存档。
@@ -565,6 +566,163 @@ EXACT 集合完全相同（`cfx_get_rounded`、`cfx_to_fp15`、`apply_mul_cfx`�
 
 定位踩坑与三条「只影响显示」的证据见 0.0 变化 3。一句话总结判据：伤害 = 总计 × 倍率，
 **不可能为负**，负值或 > 9.2e13 游戏单位必然是 wrap；`*r` 是 sret 返回槽，写它不会碰到别的统计项。
+
+### 0.1.16 新增第 19 个目标 `ship_size_max_hp`（`max_hitpoints` 的**源头**饱和）
+
+**症状**：某个 mod 把 `ship_sizes/*.txt` 的 `max_hitpoints` 设成极大值，游戏转定点时
+**不做饱和**，超过 `INT64_MAX/1e5 = 92233720368547`（92 万亿游戏单位）就 wrap 成负数，
+舰船设计界面的「基础船体」显示成负数/垃圾值。
+
+**为什么已有的 `hull_max` 钩子救不了这个症状（调度者给的判断，实测成立）**：
+`hull_max` 的重算公式第一项就是 `base = *(design + 0x10)` —— 而 `design + 0x10`
+**就是** `NShipDesign::CCalculatedValues` 的首成员（`CBaseDesignImplementation` 构造函数里
+`CCalculatedValues((CCalculatedValues *)(this + 0x10))`，Linux 3865201）。
+该字段已被上面的 wrap 污染成负数，于是游戏与我们**从同一个坏值出发**算出同样的结果：
+
+```
+sat == v   =>   if (sat != v) 永不成立   =>   永远不触发
+```
+
+这是**同向错**：重算的输入已经被污染，再忠实的重算也只是忠实复现错误。
+所以必须修**源头**。
+
+#### 链路（Linux 侧逐段读过，四段全是同一份数据）
+
+| # | 位置 | 内容 |
+|---|---|---|
+| 1 | `CShipSize::ReadMember` L3899286-3899288 | `case 0x2de3: pCVar20 = this + 0x678;` → `CReader::Read(param_10,(long*)pCVar20)` —— token `0x2de3` = `max_hitpoints`，**裸读定点，无饱和** |
+| 2 | `CShipDesignStats::AddFromShipSize` L3871571 | `SShipDesignStat::Add((SShipDesignStat*)this, (long*)(param_10 + 0x678), 4, ...)` —— **直接读该字段**累加进 `CCalculatedValues` |
+| 3 | `SShipDesignStat::Recalculate` L3870832 | `*(long*)this = lVar4 + lVar7;` —— 求和写回，`*(design+0x10)` 就是各来源之和 |
+| 4 | `CBaseDesignImplementation::RecalcSpecialValues` L3865179 | `CShipDesignStats::CalcStats((CShipDesignStats*)(this+0x10), lVar8);` —— 每次设计重建都重算 2/3 |
+
+**→ B（面板显示）不需要独立修**：面板那个「基础船体」就是 `max_hitpoints` 派生出来的，
+修好源头 A 与 B 同时正确。**这也是「单点根因」的答案 —— 确实只有一个点需要修。**
+
+而且它天然覆盖「已存盘旧设计/存档里缓存的坏值」：`CShipSize::PostReadInit` 在
+`TSingleObjectGameDatabase<CShipSizeDatabase,...>::PostReadInit`（循环全表）
+与 `ReadExistingEntry`（重建单个对象）**两条路径**上都会跑，重新读档时坏值会被重新兜住。
+
+#### 定位（两套 dump 对照）
+
+1. **Linux `CShipSize::ReadMember`（3898531）** 体内有两条**独占**字符串
+   `[%s] combat_max_speed has been removed, only max_speed is used now.` /
+   `[%s] combat_rotation_speed has been removed, only rotation_speed is used now.`
+   → 在 Windows dump 里检索该串，**唯一命中 `FUN_140d26c70`**（1303 行）= Windows 的 ReadMember。
+2. **token 与偏移三个全同**（决定性）：
+   Linux `case 0x2de0: this+0x670;  case 0x2de1: this+0x658;  case 0x2de3: this+0x678;`
+   ↔ Windows `0x2de0→param_1+0x670`、`0x2de1→param_1+0x658`、`0x2de3→param_1+0x678`，
+   读的同一个原语 `FUN_141baeaa0(reader, slot)` = Linux 的 `CReader::Read`。
+3. **取 PostReadInit 而不是 ReadMember**：ReadMember 是虚函数（Linux 有
+   `non-virtual thunk`，Windows 经 `FUN_140d30400` 虚表槽 0x18 的 adjustor thunk 进入），
+   没有可直接 patch 的唯一入口。PostReadInit 在整个 CShipSize 读完之后每个 ship size 调一次。
+
+**RVA `0x00D2B6E0` = `FUN_140d2b6e0` = `CShipSize::PostReadInit`**
+（函数体指纹：三条独占报错串 `%s upgrade size %s not found in database.` /
+`use_ai_design_role_from: invalid ship size '%s' in ship size '%s'` /
+`invalid component set "%s" in ship size %s`，以及同形的哈希表查找）。
+
+#### ABI（由两处调用点确证，不是靠函数体猜）
+
+签名 `void FUN_140d2b6e0(longlong *param_1)` —— **单参数**：
+
+```
+L2396756  FUN_140d2b6e0(*(undefined8 *)(*(longlong *)(param_1 + 0x50) + lVar2 * 8));
+L2396823  if (param_5 != '\0') { FUN_140d2b6e0(param_4); }
+```
+
+两处都只传一个指针（DB 数组元素 / 重建后的对象），与 Linux
+`void __thiscall CShipSize::PostReadInit(CShipSize *this)` 同形 → `void fn(void* self)`。
+
+#### ★★ 本轮第 5 次「函数体一样 ≠ ABI 一样」：偏移 0x678 是错的，真值是 0x6b8
+
+**这是本节最值得记的一条。** 第一版直接照抄 Linux 的 `0x678` 写进了 detour。
+活体探针一开，读回来的值全是 **0 或 1** —— 而脚本里 `@corvette_hp = 200`
+（应为存储值 20000000）。**照抄偏移会去改一个 bool。**
+
+原因：Windows 的 `CShipSize` **子对象基址是 +0x40**（`FUN_140d30400` 用
+`(**(code **)(param_4[8] + 0x18))(param_4 + 8, param_2)` 进虚表，thunk 再 +0x38 修正），
+所以 Linux 的 `ship_size + 0x678` 在 Windows 上是 `self + 0x40 + 0x678 = self + 0x6b8`。
+另注：Windows 的 CShipSize 大小 0xee8，Linux 是 0xe88，差 0x60。
+
+**独立于 Linux 的反证方法**（只用本插件**已确证**的 `ship_size_of` 与 `design+0x10`）：
+在 `hull_max` 的重算里，`ship_size_of(design)` 拿到本设计的 CShipSize，
+`base_raw = *(design + 0x10)`（**已确证**的面板基础船体值），
+再在该 CShipSize 的 `0x00..0xe00` 全范围扫「值 == base_raw」的槽位：
+
+```
+DIAG HULLMAP size=0000000404731EA0 base_raw=5000000000 (50000.0000) 命中偏移: 6b8
+```
+
+**只命中 0x6b8 一处**（连续 3 次调用都是它）。旁证：0x678 上只有 0/1（标志位）；
+0x6b8 上的取值分布是 1/100/200/300/400/600/1200/2400… 这种「整游戏单位」的船体量级。
+
+**最终实机验证**（偏移修正后）：读到的真实值
+`100 / 100000 / 0 / 0 / 300 / 450 / 600 / 600 / 900 …`，
+其中 100/300/450/600/900 **全部**能在 `common\ship_sizes\*.txt` 的
+`max_hitpoints` 字面量里找到对应值。
+
+> **教训（与 0.1.3、§2 同类）**：Linux dump 里的结构偏移**在任何情况下都不能直接用**。
+> 手册 6.4 明写这条。本轮已经用 ReadMember 的 token 映射把偏移「核对过」了 ——
+> **但核对的两个量本身就在不同的基址上**，所以「逐字对上」并不等于「同一个地址」。
+> 要证明偏移，必须有一个**不依赖 Linux** 的判据。
+
+#### 判据
+
+船体基础值**不可能为负** —— 脚本里是正数，负值只可能来自定点 wrap。
+所以判据是「`self + 0x6b8` < 0 → 封顶到 `INT64_MAX`」，与现有护盾/伤害的封顶值一致。
+**只改负值**，正常正数一律不动，误改风险为零。
+性能：每个 ship size 调一次（实测一局 737 次，含 22 个 mod），不是热路径。
+
+#### 实机验证（两轮）
+
+**第一轮（2026-10-12，用户 playset 22 个 mod）** —— 只证明「装上了、在跑、不误伤」：
+
+```
+hooked ship_size_max_hp @ 00007FF74E22B6E0（…，策略 0）
+共装上 19/19 个钩子（跳过 0）  [REPLACE 已开]
+首次调用: CShipSize::PostReadInit
+      CShipSize::PostReadInit              737
+```
+
+**本局没抓到 EVENT** —— 那套 playset 里最大的 `max_hitpoints` 只有 `5e8`，
+离溢出阈值 `9.22e13` 差 5 个数量级。所以第一轮**只有「没误伤」的证据**。
+
+**第二轮（2026-10-12，专门造的溢出测试 mod）** —— 补齐「溢出时修对了」：
+
+按 `INT64_MAX/1e5 = 92233720368547.75807` 反推：脚本值写成 `1e14`（游戏单位）
+则定点真值 `1e19 > INT64_MAX(9.22e18)`，必然 wrap 一次。用 `stl mod new` 造测试 mod，
+**整块复制**原版 `corvette` 只改 `max_hitpoints` 一处（Paradox 里同名条目是**整体替换**，
+只写一个字段会把 `entity`/`section_slots` 丢掉，船会变砖），建独立 playset 验证。
+
+对照实验（同一存档、同一个 mod，唯一变量是插件开关）：
+
+| | 设计界面「船体值」 |
+| --- | --- |
+| `stl launch --no-plugins`（无插件） | **`-84467440737095.51`** ← 原始症状 |
+| 带 satfix（回写模式） | **`92233720368547.75`** |
+
+差一个 2^64。预测值与实机读数：
+
+```
+预期 wrap 值 = 1e14 × 1e5 − 2^64 = -8446744073709551616
+EVENT CShipSize::PostReadInit max_hitpoints 溢出 max_hitpoints=-8446744073709551616
+      (-84467440737095.5156) -> 封顶到 9223372036854775807 (92233720368547.7656) [已回写]
+```
+
+**逐位相同** —— 说明①偏移读对了（读错槽位不可能凑出这个数）②封顶值正确
+③写回真的生效（界面上看得见）。
+
+第二轮同时**独立复现了 HULLMAP 探针**（第一轮的 `base_raw=5000000000` 那次已被后续运行覆盖）：
+
+```
+DIAG HULLMAP size=00000001BB949070 base_raw=1000000000 (10000.0000) 命中偏移: 6b8
+```
+
+并留下 20 条 `DIAG CShipSize::PostReadInit ... +0x6b8 max_hitpoints=<N>`，
+值域 `30/45/60/90/120/180/270/360/3000…`（游戏单位）—— 全是整数量级的船体值。
+
+> 探针与测试 mod 都是**一次性**的：`diag_recompute_calls` 已还原为 `0`，
+> 测试 mod、测试 playset 均已删除，用户 playset 未受影响。
 
 ### 0.1.15 性能修复（用户反馈「过一天变慢」）
 
@@ -782,10 +940,11 @@ detour 只做纯算术加原子计数，重活（日志格式化、配置重读�
 
 ## 3. 已确证的目标清单（按片区）
 
-**当前共 18 个目标**（EXACT 8 / INPUT_GUARD 1 / OBSERVE 9）+ 6 个辅助函数，未定位 1 个；
+**当前共 19 个目标**（EXACT 9 / INPUT_GUARD 1 / OBSERVE 9）+ 6 个辅助函数，未定位 1 个；
 完整清单与策略见第 0 节与 `src/satfix_targets_win.generated.hpp`。
 本节按片区展开**定位证据**，逐个列的是 CFixedPoint 族与变量系统那几个（它们的证据最完整、
-踩坑最多）；`shield_max`/`armor_max`/`hull_max` 与 `damage_per_day` 的证据见 0.0 与 0.1.12 ~ 0.1.15。
+踩坑最多）；`shield_max`/`armor_max`/`hull_max`、`damage_per_day` 与
+`ship_size_max_hp` 的证据见 0.0 与 0.1.12 ~ 0.1.16。
 
 比对基准是 Linux 反编译 `stellaris_4.5.2_source.cpp`；两侧 build hash 逐字节相同
 （`32709cf254181b032b1b309a6ea09776`）。复核命令：
@@ -1046,7 +1205,7 @@ python tools\win_fingerprint.py --dump ..\..\_analysis\stellaris_4.5.2_win_symbo
 
 ### 5.1 剩下的目标为什么不是「再花点时间」就能解决
 
-> ⚠️ **本节是历史存档**：那时的「剩下的 16 个」后来**全部定位完了**（18/19，唯一未定位的
+> ⚠️ **本节是历史存档**：那时的「剩下的 16 个」后来**全部定位完了**（19/20，唯一未定位的
 > `cfx_safe_sqrt_int` 已判定 Windows 侧不存在）。当时总结的三条判据 —— 类型恢复、BSim、
 > 活体探针的局限 —— 如今被**更有效的三条**取代：NDefines 名字法（0.1.8、0.1.10）、
 > **片区扫**（0.1.14，靠它救回了一次错误定位）、**ModifierType 序列逐个比对**（0.1.14）。
@@ -1091,7 +1250,7 @@ python tools\win_fingerprint.py --dump ..\..\_analysis\stellaris_4.5.2_win_symbo
 注意「`var_multiply` 升级成 EXACT」这句**已过时**（当前是 OBSERVE，见 0.1.4 的更正），
 而三个上限函数与 `damage_per_day` 现在是 EXACT。当前状态见第 0 节。下面保留原样存档。
 
-- 覆盖 8/23 个目标（**当时**的数字；当前 **18/19**，见第 0 节）。其中 4 个 EXACT
+- 覆盖 8/23 个目标（**当时**的数字；当前 **19/20**，见第 0 节）。其中 4 个 EXACT
   （`cfx_get_rounded`、`cfx_to_fp15`、`apply_mul_cfx`、`apply_mul_fp15`），4 个 OBSERVE。
   主战场 `ApplyModifierMult` 两个重载已拿下，且实机确认 `apply_mul_cfx` 被调用 144 万次/局。
 - `apply_mul_cfx` / `apply_mul_fp15` 身份未证实，插件不装它们。首选候选 `FUN_1403e6aa0`
@@ -1149,6 +1308,16 @@ python tools\win_fingerprint.py --dump ..\..\_analysis\stellaris_4.5.2_win_symbo
 - **封顶值只能是 `INT64_MAX`**：定点格式本身的天花板。「单组件上限 × N」在数学上做不到，
   超过就立刻再 wrap，所以 92 万亿游戏单位是物理天花板，不是保守选择。
 - **`damage_per_day` 只影响面板显示**，不影响实际伤害（三条证据见 0.0 变化 3）。
+- **`ship_size_max_hp` 的判据只有「负值」这一条，没有重算比对**。
+  这是刻意的：船体基础值不可能为负，负值即 wrap 的铁证，不需要再算一遍去比对
+  （不像护盾/装甲要靠「重算相等」挡掉真负）。
+  **溢出侧已于 2026-10-12 用专门造的测试 mod 实测通过**（见 0.1.17），
+  不再是「只有没误伤的证据」。
+- **`ship_size_max_hp` 的偏移 0x6b8 已由两条独立路径确认**：①静态推导 —— `ReadMember`
+  的 `this = param_4+0x40` 且读 `this+0x678`，`PostReadInit` 的 `self = param_4`，
+  两者必然指向同一字段；②活体探针 HULLMAP —— 在同一个 CShipSize 里扫「值 == 面板基础值」
+  的槽位，`0x00..0xe00` 只命中 0x6b8 一处。探针样本目前是 3 次、落在同一条 design 上；
+  偏移是结构常量不随存档变，但想扩大样本可把 `diag_recompute_calls` 打开并调大 HULLMAP 上限。
 - **性能**：热路径每局被调用百万到千万次，任何逐调用开销都会被放大成可见的卡顿。
   已修两处（早退 + `fast_read`），但以后再加诊断必须能一键关掉。
 

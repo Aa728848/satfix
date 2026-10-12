@@ -323,13 +323,14 @@ enum : int {
     kIdxMpe15,
     kIdxMpe7,
     kIdxDamagePerDay,
+    kIdxShipSizeMaxHp,
     kIdxCount
 };
 
 // kIdx* 是**计数/报告**用的下标，与 kTargets[] 的顺序无关：安装走的是 t.key 字符串匹配，
 // 每个 detour 内部用自己那个 kIdx 常量，所以两边不会串。
 // 这里只钉住「下标个数 == 目标个数」，防止加了目标忘了加计数器。
-static_assert(kTargetCount == 18, "kIdx* 下标个数需要跟着 kTargets 更新");
+static_assert(kTargetCount == 19, "kIdx* 下标个数需要跟着 kTargets 更新");
 const char* const kIdxNames[kIdxCount] = {
     "GetRounded/GetRounded64",
     "operator fpml::fixed_point<...,15>",
@@ -349,11 +350,12 @@ const char* const kIdxNames[kIdxCount] = {
     "CalcMilitaryPowerExponent<15>",
     "CalcMilitaryPowerExponent<7>",
     "CalcAverageDamagePerDay",
+    "CShipSize::PostReadInit",
 };
 std::atomic<uint64_t> g_fn_calls[kIdxCount];
 bool g_fn_seen[kIdxCount] = {false, false, false, false, false, false, false, false,
                              false, false, false, false, false, false, false, false,
-                             false, false};
+                             false, false, false};
 
 /// 主线程泵：只在游戏主线程进入被 hook 函数时被调用。
 /// detour 里只做原子写，把重活推迟到这里 —— 满足手册 6.3。
@@ -1329,6 +1331,7 @@ struct MaxHpDetail {
     int64_t base_raw = 0, add_in = 0, add_mul = 0, cls_base = 0, cls_mul = 0;
     int64_t cls_tbl = 0;
     int64_t factor = 0, sat = 0;
+    const void* size = nullptr;   ///< ship_size_of(design)，诊断用
 };
 
 bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods, int64_t* out,
@@ -1350,6 +1353,7 @@ bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods
         if (d) d->stage = 2;
         return false;
     }
+    if (d) d->size = size;
 
     int64_t base = 0;
     if (!whk::fast_read(&base, static_cast<const char*>(design) + r.design_off, sizeof base)) {
@@ -1496,6 +1500,30 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
                  (long long)d.base_raw, (long long)d.add_in, (long long)d.add_mul,
                  (long long)d.cls_base, (long long)d.cls_mul, (long long)d.cls_tbl,
                  (long long)d.factor, (long long)d.sat, mbuf);
+
+            // ★ 布局反证（一次性）：`design + 0x10`（CCalculatedValues 首成员）
+            // 就是从 CShipSize 的某个字段派生的（Linux 侧是 max_hitpoints = ship_size+0x678）。
+            // 在**同一个** CShipSize 对象里扫出「值等于 base_raw」的偏移，就能
+            // **独立于 Linux** 定位 Windows 侧那个字段到底住哪（手册 6.4）。
+            if (&recipe == &kRecipeHull && d.size != nullptr && d.base_raw != 0) {
+                static std::atomic<int> probed{0};
+                if (probed.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    char hit[256];
+                    int ho = 0;
+                    for (int64_t off = 0; off < 0xe00 && ho < 200; off += 8) {
+                        int64_t s = 0;
+                        if (!whk::fast_read(&s, static_cast<const char*>(d.size) + off,
+                                            sizeof s))
+                            continue;
+                        if (s == d.base_raw)
+                            ho += (int)_snprintf_s(hit + ho, sizeof hit - ho, _TRUNCATE,
+                                                   "%llx ", (unsigned long long)off);
+                    }
+                    logf("DIAG HULLMAP size=%p base_raw=%lld (%.4f) 命中偏移: %s",
+                         const_cast<void*>(d.size), (long long)d.base_raw,
+                         static_cast<double>(d.base_raw) / 1e5, ho > 0 ? hit : "(无)");
+                }
+            }
         }
     }
 
@@ -1659,6 +1687,132 @@ long long* detour_hull_max(long long* ret, const void* design, const void* mods,
                            const void* tooltip) {
     return detour_max_hp("CalcMaxHitPoints", kIdxHullMax, g_hook_hull_max, kRecipeHull, ret, design,
                          mods, fleet, tooltip);
+}
+
+//  8) CShipSize::PostReadInit —— max_hitpoints 的**源头**饱和（EXACT）
+//
+//  ---------------------------------------------------------------------------
+//  为什么必须有这个钩子（现有 hull_max 救不了这个症状）
+//  ---------------------------------------------------------------------------
+//  `hull_max` 的重算公式第一项是 `base = *(design + 0x10)` —— 那**就是**
+//  `NShipDesign::CCalculatedValues` 的首成员（`CBaseDesignImplementation` 构造函数里
+//  `CCalculatedValues((CCalculatedValues *)(this + 0x10))`，Linux 3865201）。
+//  当 `ship_sizes/*.txt` 的 `max_hitpoints` 过大时，游戏把它写成 wrap 后的负数，
+//  `CCalculatedValues` 随之也是负数 —— 于是：
+//
+//      游戏从坏值出发算 -> 负数
+//      我们从**同一个**坏值出发算 -> 同样的负数
+//      => `sat == v`，`if (sat != v)` 永不成立 => 永远不触发
+//
+//  这是**同向错**：重算的输入已经被污染，再忠实的重算也只是忠实地复现错误。
+//  所以必须修**源头**（CShipSize 的 max_hitpoints 字段），而不是在下游找第二个兜底点。
+//
+//  ---------------------------------------------------------------------------
+//  为什么 B（面板显示）不需要独立修 —— 单点根因的完整链路
+//  ---------------------------------------------------------------------------
+//  Linux 侧逐段读过，全部是**同一份数据**（注意：0x678 是 **Linux** 偏移，
+//  Windows 上是 0x6b8，见本函数末尾）：
+//    1. `CShipSize::ReadMember`  L3899286-3899288
+//         `case 0x2de3: pCVar20 = this + 0x678;` -> `CReader::Read(param_10,(long*)pCVar20)`
+//       —— token 0x2de3 = `max_hitpoints`，裸读定点，**无饱和**。
+//    2. `CShipDesignStats::AddFromShipSize`  L3871571
+//         `SShipDesignStat::Add((SShipDesignStat *)this, (long *)(param_10 + 0x678), 4, ...)`
+//       —— **直接读 CShipSize 的 max_hitpoints** 累加进 `CCalculatedValues`（`design + 0x10`）。
+//    3. `SShipDesignStat::Recalculate`  L3870832 `*(long *)this = lVar4 + lVar7;`
+//       —— 求和写回，`*(design + 0x10)` 就是各来源之和。
+//    4. `CBaseDesignImplementation::RecalcSpecialValues`  L3865179
+//         `CShipDesignStats::CalcStats((CShipDesignStats *)(this + 0x10), lVar8);`
+//       —— 每次设计重建都重算一遍 2/3。
+//
+//  即：面板那个「基础船体」就是 CShipSize 的 max_hitpoints 派生出来的
+//  （这一条**已在 Windows 侧用活体探针实测确认**，见函数末尾的 HULLMAP）。
+//  **修好源头，A 与 B 同时正确**，不需要第二个钩子。
+//  ⚠️ 这也覆盖了「已存盘旧设计/存档里缓存的坏值」：PostReadInit 在
+//  `TSingleObjectGameDatabase<CShipSizeDatabase,...>::PostReadInit`（循环全表）与
+//  `ReadExistingEntry`（重建单个对象）**两条路径**上都会跑，
+//  所以重新读档时坏值会被重新兜住。
+//
+//  ---------------------------------------------------------------------------
+//  ABI（由两处调用点确证，见 gen_targets_win.py 的 evidence）
+//  ---------------------------------------------------------------------------
+//      void fn(void* self /*rcx, CShipSize* this*/)
+//    L2396756  `FUN_140d2b6e0(*(undefined8 *)(*(longlong *)(param_1 + 0x50) + lVar2 * 8));`
+//    L2396823  `if (param_5 != '\0') { FUN_140d2b6e0(param_4); }`
+//  两处都只传**一个**指针。单参数，无 sret，返回 void。
+//
+//  ---------------------------------------------------------------------------
+//  判据（宁可漏报，不可误改）
+//  ---------------------------------------------------------------------------
+//  船体基础值**不可能为负**：脚本里 `max_hitpoints` 是正数，
+//  负值只可能来自定点 wrap。所以「max_hitpoints 槽位 < 0」是**铁证**，
+//  封顶到 `INT64_MAX`（= 92 万亿游戏单位那个天花板，与护盾/伤害一致）。
+//  **任何正常正数一律不动** —— 不读它就不改它，误改风险为零。
+//
+//  性能：每个 ship size 调一次（一条 DB 几十条），不是热路径；
+//  正常路径 = 一次 fast_read + 一次比较。
+//
+//  ---------------------------------------------------------------------------
+//  偏移 0x6b8 是 Windows 侧实测出来的，不是照抄 Linux 的 0x678
+//  ---------------------------------------------------------------------------
+//  CShipSize 在 Windows（MSVC）里的**子对象基址是 +0x40**，
+//  所以 Linux 的 `ship_size + 0x678` 在 Windows 上是 `self + 0x40 + 0x678 = self + 0x6b8`。
+//  实测证据（手册 6.4「不要依赖 Linux 的结构偏移」，这条是硬要求）：
+//    活体探针 `DIAG HULLMAP size=%p base_raw=5000000000 (50000.0000) 命中偏移: 6b8`
+//  —— base_raw 就是 `*(design + 0x10)`（**已确证**的面板基础船体值），
+//  在**同一个 CShipSize 对象**里全量扫描「值 == base_raw」的槽位，
+//  0x00..0xe00 范围内**只命中 0x6b8 一处**（连续 3 次调用都是它）。
+//  旁证：0x6b8 上的取值分布是 1/100/200/300/400/600/1200/2400… 这种
+//  「整游戏单位」的船体量级，与脚本里 `@corvette_hp = 200` 之类完全吻合；
+//  而 0x678 上只有 0/1（是个标志位），显然不是船体值 ——
+//  **如果照抄 Linux 的 0x678，就会去改一个 bool**。
+//  另注：Windows 的 CShipSize 大小是 0xee8（Linux 是 0xe88），差 0x60。
+constexpr int64_t kShipSizeMaxHpOff = 0x6b8;
+
+whk::TypedHook<void (*)(void*)> g_hook_ship_size_max_hp;
+
+void detour_ship_size_post_read_init(void* self) {
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    g_fn_calls[kIdxShipSizeMaxHp].fetch_add(1, std::memory_order_relaxed);
+    note_first_call(kIdxShipSizeMaxHp);
+    game_thread_pump();
+
+    g_hook_ship_size_max_hp.call(self);
+
+    // 地址来自游戏传入的 this，可信 —— 用 fast_read（手册 6.4 / README 0.1.15）。
+    int64_t v = 0;
+    if (!whk::fast_read(&v, static_cast<const char*>(self) + kShipSizeMaxHpOff, sizeof v))
+        return;
+
+    // 诊断（默认关，diag_recompute_calls > 0 才走）：打印真实读到的 max_hitpoints。
+    // 「没抓到 EVENT」时，这是唯一能区分「判据没通」与「这局真没溢出」的东西。
+    if (g_settings.diag_recompute_calls > 0) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 20)
+            logf("DIAG CShipSize::PostReadInit self=%p +0x%llx max_hitpoints=%lld (%.4f)%s",
+                 self, (unsigned long long)kShipSizeMaxHpOff, (long long)v,
+                 static_cast<double>(v) / 1e5, v < 0 ? "  <== 负值（wrap 特征）" : "");
+    }
+
+    if (v >= 0) return;  // ★ 正常值（含 0）一律不动 —— 快速路径
+
+    g_events.fetch_add(1, std::memory_order_relaxed);
+    if (g_settings.verbose_events)
+        logf("EVENT CShipSize::PostReadInit max_hitpoints 溢出 max_hitpoints=%lld (%.4f) "
+             "-> 封顶到 %lld (%.4f)%s",
+             (long long)v, static_cast<double>(v) / 1e5, (long long)kSaturateCap,
+             static_cast<double>(kSaturateCap) / 1e5,
+#if SATFIX_REPLACE
+             " [已回写]"
+#else
+             " [影子模式，未改数值]"
+#endif
+        );
+#if SATFIX_REPLACE
+    g_replaced.fetch_add(1, std::memory_order_relaxed);
+    // 直接写：与 detour_max_hp 的 `*r = sat` 同一手法。上面那次 fast_read 已经
+    // 证明这一页可读；CShipSize 是游戏自己刚写过的堆对象，可写是必然的。
+    *reinterpret_cast<int64_t*>(static_cast<char*>(self) + kShipSizeMaxHpOff) = kSaturateCap;
+#endif
 }
 
 //  7) CModifier::ApplyModifierMult —— 数值放大的主出口，EXACT
@@ -2108,6 +2262,8 @@ void install_hooks() {
             ok = g_hook_hull_max.install(res[i].addr, &detour_hull_max);
         else if (std::strcmp(t.key, "damage_per_day") == 0)
             ok = g_hook_damage.install(res[i].addr, &detour_damage_per_day);
+        else if (std::strcmp(t.key, "ship_size_max_hp") == 0)
+            ok = g_hook_ship_size_max_hp.install(res[i].addr, &detour_ship_size_post_read_init);
         else {
             logf("目标 %s 没有对应的 detour（目标表与代码不同步）", t.key);
             continue;
