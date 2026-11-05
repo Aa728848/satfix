@@ -1,0 +1,267 @@
+{
+ "exe": "D:\\Steam\\steamapps\\common\\Stellaris\\stellaris.exe",
+ "text_rva": 4096,
+ "targets": {
+  "cfx_get_rounded": {
+   "old_rva": 28623216,
+   "old_size": 50,
+   "hits": [
+    {
+     "rva": 28642528,
+     "delta": 19312
+    }
+   ]
+  },
+  "cfx_to_fp15": {
+   "old_rva": 28623008,
+   "old_size": 87,
+   "hits": [
+    {
+     "rva": 28642320,
+     "delta": 19312
+    }
+   ]
+  },
+  "apply_mul_cfx": {
+   "old_rva": 3596160,
+   "old_size": 286,
+   "hits": [
+    {
+     "rva": 3598736,
+     "delta": 2576
+    }
+   ]
+  },
+  "apply_mul_fp15": {
+   "old_rva": 3596448,
+   "old_size": 206,
+   "hits": [
+    {
+     "rva": 3599024,
+     "delta": 2576
+    }
+   ]
+  },
+  "cfx_round_to": {
+   "old_rva": 28623280,
+   "old_size": 282,
+   "hits": [
+    {
+     "rva": 28642592,
+     "delta": 19312
+    }
+   ]
+  },
+  "cfx_atan2": {
+   "old_rva": 28623568,
+   "old_size": 810,
+   "hits": [
+    {
+     "rva": 28642880,
+     "delta": 19312
+    }
+   ]
+  },
+  "var_multiply": {
+   "old_rva": 24608512,
+   "old_size": 604,
+   "hits": [
+    {
+     "rva": 24626784,
+     "delta": 18272
+    }
+   ]
+  },
+  "var_add": {
+   "old_rva": 24606720,
+   "old_size": 137,
+   "hits": [
+    {
+     "rva": 24624992,
+     "delta": 18272
+    }
+   ]
+  },
+  "cfx_get_rounded_fp15": {
+   "old_rva": 28623104,
+   "old_size": 111,
+   "hits": [
+    {
+     "rva": 28642416,
+     "delta": 19312
+    }
+   ]
+  },
+  "shield_max": {
+   "old_rva": 10558848,
+   "old_size": 2960,
+   "hits": [
+    {
+     "rva": 10575296,
+     "delta": 16448
+    }
+   ]
+  },
+  "armor_max": {
+   "old_rva": 10561808,
+   "old_size": 2558,
+   "hits": [
+    {
+     "rva": 10578256,
+     "delta": 16448
+    }
+   ]
+  },
+  "hull_max": {
+   "old_rva": 10556064,
+   "old_size": 2784,
+   "hits": [
+    {
+     "rva": 10572512,
+     "delta": 16448
+    }
+   ]
+  },
+  "cfx_sqrt": {
+   "old_rva": 28608976,
+   "old_size": 686,
+   "hits": [
+    {
+     "rva": 28628288,
+     "delta": 19312
+    }
+   ]
+  },
+  "cfx_safe_sqrt": {
+   "old_rva": 28624384,
+   "old_size": 573,
+   "hits": [
+    {
+     "rva": 28643696,
+     "delta": 19312
+    }
+   ]
+  },
+  "diplo_weight": {
+   "old_rva": 8619632,
+   "old_size": 666,
+   "hits": [],
+   "fuzzy": [
+    [
+     0.9919743178170144,
+     8624960
+    ],
+    [
+     0.20224719101123595,
+     6966020
+    ],
+    [
+     0.1637239165329053,
+     11821488
+    ]
+   ]
+  },
+  "mpe15": {
+   "old_rva": 10527904,
+   "old_size": 356,
+   "hits": [
+    {
+     "rva": 10544352,
+     "delta": 16448
+    }
+   ]
+  },
+  "mpe7": {
+   "old_rva": 10528272,
+   "old_size": 341,
+   "hits": [
+    {
+     "rva": 10544720,
+     "delta": 16448
+    }
+   ]
+  },
+  "damage_per_day": {
+   "old_rva": 10570848,
+   "old_size": 4336,
+   "hits": [
+    {
+     "rva": 10587296,
+     "delta": 16448
+    }
+   ]
+  },
+  "ship_size_max_hp": {
+   "old_rva": 13809376,
+   "old_size": 1858,
+   "hits": [],
+   "fuzzy": [
+    [
+     0.7751937984496124,
+     13830768
+    ]
+   ]
+  },
+  "access_var_pointer": {
+   "old_rva": 10452464,
+   "old_size": 205,
+   "hits": [
+    {
+     "rva": 10459568,
+     "delta": 7104
+    }
+   ]
+  },
+  "cvars_get": {
+   "old_rva": 2257808,
+   "old_size": 217,
+   "hits": [
+    {
+     "rva": 2257600,
+     "delta": -208
+    }
+   ]
+  },
+  "cvars_set": {
+   "old_rva": 8039952,
+   "old_size": 108,
+   "hits": [
+    {
+     "rva": 8044816,
+     "delta": 4864
+    }
+   ]
+  },
+  "cfp_getvalue": {
+   "old_rva": 3462400,
+   "old_size": 1470,
+   "hits": [],
+   "fuzzy": [
+    [
+     0.9882468168462292,
+     3465072
+    ]
+   ]
+  },
+  "ship_size_of": {
+   "old_rva": 3205520,
+   "old_size": 69,
+   "hits": [
+    {
+     "rva": 3207984,
+     "delta": 2464
+    }
+   ]
+  },
+  "modifier_value": {
+   "old_rva": 13802960,
+   "old_size": 312,
+   "hits": [
+    {
+     "rva": 13824352,
+     "delta": 21392
+    }
+   ]
+  }
+ }
+}

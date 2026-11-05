@@ -16,7 +16,8 @@
 | `satfix-win/` | Windows | Stellaris Launcher 插件 DLL（`satfix.dll`），靠硬编码 RVA + 序言签名定位 |
 | `hooklib/` | 共用 | Linux 侧的 hook 引擎（`shk`）；Windows 侧是自带的 `winhook.hpp` |
 
-游戏版本：**Cygnus v4.5.2**，`stellaris.exe` build 时间戳 `0x6ABEAA3F`。
+游戏版本：**Cygnus v4.5.3**，`stellaris.exe` build 时间戳 `0x6AE49C1B`（4.5.2 是 `0x6ABEAA3F`，
+当年那套地址与 dump 都还在，重定位流程见 `satfix-win/README.md` 的「游戏更新后」）。
 
 ---
 
@@ -78,7 +79,7 @@ dump 格式（两份一致，`// ==== <name> End ====` 分隔）：
    - **调用者/被调用者**：见下。
 3. **在 Windows dump 里按指纹筛候选**，逐个读函数体确认。
 4. **【必做】核对 ABI —— 看调用点，不是看函数体**（见 §2）。
-5. 把结论加进 `satfix-win/tools/gen_targets_win.py` 的 `CONFIRMED` 表（格式 `(key, desc, rva, strat, sig, evidence)`，6 个字段），
+5. 把结论加进 `satfix-win/tools/gen_targets_win.py` 的 `CONFIRMED` 表（格式 `(key, desc, rva, strat, evidence)`，5 个字段 —— 序言签名由脚本从 exe 现读，不用手写），
    然后 `python tools/gen_targets_win.py` 重新生成头文件。
 
 ### 定位手段（按实战效果排序）

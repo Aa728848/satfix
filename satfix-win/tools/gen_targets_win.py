@@ -78,8 +78,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_get_rounded",
         "CFixedPoint::GetRounded() const  /  GetRounded64() const",
-        0x01B4C170,
+        0x01B50CE0,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，全 .text 唯一命中；.pdata 无条目=叶子函数（预期），旧 50B 全同。位移 +0x4B70，"
         "win dump FUN_141b4c170（17 行）："
         "lVar1=*p1; lVar2=lVar1-50000; if(-1<lVar1) lVar2=lVar1+50000; return lVar2/100000; "
         "与 Linux 的 CFixedPoint::GetRounded/GetRounded64（反编译 8599412/8599430，两函数体**完全相同**）"
@@ -90,8 +91,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_to_fp15",
         "CFixedPoint::operator fpml::fixed_point<long long,48,15>() const",
-        0x01B4C0A0,
+        0x01B50C10,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；叶子函数无 .pdata 条目（预期）；旧 87B 全同。位移 +0x4B70，"
         "**ABI 靠调用点确证，不是靠猜**。同族有两个实例，签名不同："
         "(a) FUN_141b4c0a0：*param_2 = ((*param_1 % 100000)*0x40000000)/0xc3500000 "
         "+ (*param_1/100000)*0x8000；调用点 `FUN_141b4c0a0(&DAT_1431517c8, local_368)` —— "
@@ -110,8 +112,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "apply_mul_cfx",
         "CModifier::ApplyModifierMult(CFixedPoint&, CModifier const&, ModifierType, bool)",
-        0x0036DF80,
+        0x0036E990,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=286 与旧 286 相同。位移 +0xA10，"
         "**用「调用者」定位成功的**（函数体指纹分不出来，见 5.1）。"
         "方法：Linux 侧有 78 个函数调用 ApplyModifierMult，其中 35 个带字符串字面量；"
         "取 `CalcStarbaseCapacity`（它的 STARBASE_CAPACITY_MAX_REACHED 唯一命中 Windows "
@@ -131,8 +134,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "apply_mul_fp15",
         "CModifier::ApplyModifierMult(fpml::fixed_point<...,15>&, CModifier const&, ModifierType, bool)",
-        0x0036E0A0,
+        0x0036EAB0,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=206 与旧 206 相同。位移 +0xA10，"
         "与 apply_mul_cfx 地址相邻（0x36E0A0 vs 0x36DF80），是同一族的第二个重载。"
         "体内把 `operator fpml::fixed_point<...,15>` **内联**了（所以按「调用 FUN_141b4c0a0」"
         "搜不到，我一开始就是这么搜空的）："
@@ -145,8 +149,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_round_to",
         "CFixedPoint::RoundTo(CFixedPoint const&)",
-        0x01B4C1B0,
+        0x01B50D20,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=282 与旧 282 相同。位移 +0x4B70，"
         "win dump FUN_141b4c1b0（31 行）与 Linux CFixedPoint::RoundTo（反编译 8599448）同构："
         "先按 `lVar3 + 0x53e2d6238da3U < 0xa7c5ac471b47` 判量级（0x53e2d6238da3 = 2^62/5 量级的安全界），"
         "小量级走 `(lVar3*100000)/200000`、大量级走 `(lVar2%200000)*100000/200000 + (lVar3%100000)*100000/200000` "
@@ -160,8 +165,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_atan2",
         "CFixedPoint::Atan2(CFixedPoint const&, CFixedPoint const&)",
-        0x01B4C2D0,
+        0x01B50E40,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】810B 全同，唯一命中；.pdata 把整段切成 4 块（8/543/9/250=810）。位移 +0x4B70，"
         "win dump FUN_141b4c2d0（98 行，Linux Atan2 也是这个量级）同时命中 **Atan2 的五个标志常量**："
         "`0x132cb`(= 3.1416/4 × 1e5，Linux 版 `(long)(uVar8 * 0x132cb) / 100000` 用的就是这个)、"
         "`0x39863`(= 3.1416 × 1e5，Linux 版的 `lVar5 = 0x39863`)、"
@@ -174,8 +180,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "var_multiply",
         "CMultiplyVariableEffect::ExecuteActual(CEventScope&) const",
-        0x01777F00,
+        0x0177C660,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=604 与旧 604 相同；其 10 个调用点全部按同一顺序对上（见 cfp_getvalue 条）。位移 +0x4760，"
         "**RVA 已更正 —— 旧的 0x00231640 装错了函数，见下。**"
         "确证方式（字符串 + 调用者语义）：Linux 版 CMultiplyVariableEffect::ExecuteActual "
         "（反编译 6574198-6574255）里有一条独占的诊断串 "
@@ -196,8 +203,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "var_add",
         "CAddVariableEffect::ExecuteActual(CEventScope&) const",
-        0x01777800,
+        0x0177BF60,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=137 与旧 137 相同。位移 +0x4760，"
         "确证方式（调用者法 + 体形比对）：先用**已确证的** var_multiply（0x1777F00）"
         "提取出它调用的 4 个 helper RVA（0x9F7DF0 / 0x34D500 / 0x227390 / 0x7AAE10），"
         "再在 dump 里找「同时调用这 4 个」的函数 —— 命中 6 个（正是变量效果家族），"
@@ -217,8 +225,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_get_rounded_fp15",
         "CFixedPoint::GetRounded(fpml::fixed_point<long long,48,15> const&)",
-        0x01B4C100,
+        0x01B50C70,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；叶子函数无 .pdata 条目（预期）；旧 111B 全同。位移 +0x4B70，"
         "win dump FUN_141b4c100（23 行）与 Linux CFixedPoint::GetRounded(fpml::fixed_point<...> "
         "const&)（反编译 8599289）结构同构："
         "uVar3 = x<1 ? (-(uint)((x & 0x7fff)!=0) & 0x8000) + x : x; "
@@ -235,8 +244,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "shield_max",
         "NShipUtil::CalcMaxShieldHitPoints(CBaseDesignImplementation const&, CModifier const&, "
         "CFleet const*, CToolTip*)",
-        0x00A11D80,
+        0x00A15DC0,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=2960 与旧 2960 相同。位移 +0x4040，"
         "**按「CShipSize 修正类型表偏移」确证，两条独立签名同时命中。**"
         "签名一（表偏移）：Linux 版体内有 6 个该表的索引常量 "
         "0x1614c/0x16158/0x161fc/0x16208/0x162ac/0x162b8（= ModifierType 枚举值，"
@@ -255,8 +265,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "armor_max",
         "NShipUtil::CalcMaxArmorHitPoints(CBaseDesignImplementation const&, CModifier const&, "
         "CFleet const*, CToolTip*)",
-        0x00A12910,
+        0x00A16950,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=2558 与旧 2558 相同。位移 +0x4040，"
         "**本目标的确证强度最高：常量三元组在 110843 个函数块里唯一。**"
         "Linux 版体内有装甲专用的表索引常量 0x15fec/0x15ff8/0x160a8；"
         "把这三个常量同时作为检索条件扫过全部函数块，**命中数 = 1**，就是 FUN_140a12910。"
@@ -271,8 +282,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "hull_max",
         "NShipUtil::CalcMaxHitPoints(CBaseDesignImplementation const&, CModifier const&, "
         "CFleet const*, CToolTip*)",
-        0x00A112A0,
+        0x00A152E0,
         STRAT_EXACT,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=2784 与旧 2784 相同。位移 +0x4040，"
         "**按「CShipSize 修正类型表偏移」确证。**签名一（表偏移）：Linux 版体内有船体专用的 "
         "索引常量 0x13b7c/0x13b88/0x13c2c/0x13c38/0x1538c/0x15398/0x1543c/0x15448，"
         "逐个检索后 0x13b7c/0x13b88/0x13c38/0x15398/0x15448 **只出现在 FUN_140a112a0**"
@@ -288,8 +300,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_sqrt",
         "CFixedPoint::Sqrt() const  /  fixed_int64::sqrt(fixed_int64*)",
-        0x01B489D0,
+        0x01B4D540,
         STRAT_INPUT_GUARD,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=686 与旧 686 相同。位移 +0x4B70，"
         "**用「调用者法」定出来的（与 apply_mul_cfx 同一套路，本轮第二次奏效）。**"
         "先找 Linux 里谁调用 Sqrt：只有 CalcDistance(1987515)、"
         "SetCardinalPatronAttunement、HackyButSafeSqrt、CalculateTargetRotationAndSpeed 四个。"
@@ -313,8 +326,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "cfx_safe_sqrt",
         "CFixedPoint::SafeSqrt() const",
-        0x01B4C600,
+        0x01B51170,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=573 与旧 573 相同。位移 +0x4B70，"
         "**从上一步的结果顺出来的**：确证 Sqrt(0x1B489D0) 后找它的调用者，"
         "发现 FUN_141b4c600 既是「Sqrt 的调用者」又是「被 7 个函数调用的公用入口」。"
         "读体与 Linux CFixedPoint::SafeSqrt() const（8599678）**逐行同构**："
@@ -330,8 +344,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "diplo_weight",
         "CPopJob::CalcDiplomaticWeight(CPopGroup const&) const",
-        0x00838670,
+        0x00839B40,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】整段 666B 被 .pdata 切成 5 个连续块（43+74+524+5+20=666，与旧 size 完全相同），所以整段字节比对会在尾部失配；按指令形状对齐后**前 178 条指令逐条相同**，差异只在收尾（旧版把 rbx 存回栈、新版没有 —— 寄存器分配差异）。位移 +0x14D0，"
         "**本轮最有价值的一个 —— 用「NDefines 名字 thunk」定出来的全新方法。**"
         "难点背景：这个函数在 Linux 里**没有任何直接调用者**（只有 4 处提及，全是它自己），"
         "所以「调用者法」对它无效；而按守卫密度筛出 24 个候选、按结构偏移 `+0x808` 命中 0 个。"
@@ -364,8 +379,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "mpe15",
         "NCombatRules::CalcMilitaryPowerExponent(fpml::fixed_point<long long,48,15>, "
         "fpml::fixed_point<long long,48,15>)",
-        0x00A0A4A0,
+        0x00A0E4E0,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=356 与旧 356 相同。位移 +0x4040，"
         "**靠「NDefines 名字法」顺出来的（第三个方法，本轮第二次用它破局）。**"
         "上两轮对这个目标完全卡住：调用者法无效（调用者不带独占字符串）、"
         "常量法无效（Linux 的 0x15bf1 与 0x7fffffff8000 在 Windows 侧都是 0 次）、"
@@ -395,8 +411,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "mpe7",
         "NCombatRules::CalcMilitaryPowerExponent(fpml::fixed_point<long long,56,7>, "
         "fpml::fixed_point<long long,56,7>)",
-        0x00A0A610,
+        0x00A0E650,
         STRAT_OBSERVE,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=341 与旧 341 相同。位移 +0x4040，"
         "与 mpe15 同源、同一轮确证（见上条）。判据是**编码**："
         "本函数用 `<<7` / `>>7` / `0x80` / `0x7f` / `0xffffffffffffff80`，"
         "是 fpml 的 7 位小数编码；而 Linux mpe7 体内的掩码常量正是 "
@@ -413,8 +430,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "damage_per_day",
         "NShipUtil::CalcAverageDamagePerDay(CBaseDesignImplementation const&, ...) "
         "—— 设计师面板的「伤害」",
-        0x00A14C60,
+        0x00A18CA0,
         "EXACT",
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=4336 与旧 4336 相同。位移 +0x4040，"
         "**先错了一次，这里是改正后的结论。**"
         "第一版按独占常量 0xb50679d3 在**全库**搜，得到 3 个候选，我挑了行数最接近的 "
         "FUN_1403c2910（851 行）—— 那是**错的**：实测打开舰船面板时它算出来的是"
@@ -444,8 +462,9 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
     (
         "ship_size_max_hp",
         "CShipSize::PostReadInit() —— 解析完 ship_sizes/*.txt 后的 max_hitpoints 饱和兜底",
-        0x00D2B6E0,
+        0x00D30A70,
         STRAT_EXACT,
+        "【4.5.3 重定位】字节比对 0.775（因结构偏移漂移），改按指令形状比对：**424 vs 421 条，相似度 0.9941**，唯一高分候选（第二名 0.3356）；.pdata 单条起点 size=1870（旧 1858）。唯一差异是把「cmp [rax+..], ecx」展开成「cmp r14d, ecx / jl ../ cmp ecx, [rax+..]」。位移 +0x5390，"
         "**症状**：`ship_sizes/*.txt` 的 `max_hitpoints` 是脚本浮点字面量，游戏转定点时"
         "**不做饱和**；超过 `INT64_MAX/1e5 = 92233720368547`（92 万亿游戏单位）就 wrap 成负数，"
         "舰船设计界面的「基础船体」显示成负数/垃圾值。\n"
@@ -564,7 +583,8 @@ HELPERS: list[tuple[str, str, int, str]] = [
     (
         "access_var_pointer",
         "AccessVariablePointer(CEventScope&, CString const&)",
-        0x009F7DF0,
+        0x009F99B0,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=205 与旧 205 相同。位移 +0x1BC0，"
         "从 var_multiply 的调用点读出。体内先建字符串 \"local_\" 再 "
         "FUN_141b2f670(name, len, 0, \"local_\", 6)（= 拼前缀判断），"
         "随后按 CEventScope 是否已绑定分别走 FUN_1403965c0/FUN_140396a90/FUN_140392020 —— "
@@ -573,7 +593,8 @@ HELPERS: list[tuple[str, str, int, str]] = [
     (
         "cvars_get",
         "CVariables::GetVariable(CString const&) const",
-        0x00227390,
+        0x002272C0,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=217 与旧 217 相同。位移 -0xD0，"
         "从 var_multiply 的调用点读出（实参是 vars+8，所以它接的是 CVariables 的哈希表头）。"
         "体内 FUN_141b430e0(0, name, len) 算哈希，`(uVar3 & uVar5)*0x40 + *(param_1+8)` 定位桶，"
         "再 memcmp 比名字；**返回条目指针**，条目 +0x38 就是 CFixedPoint 值。"
@@ -583,7 +604,8 @@ HELPERS: list[tuple[str, str, int, str]] = [
     (
         "cvars_set",
         "CVariables::SetVariable(CString const&, CFixedPoint)",
-        0x007AAE10,
+        0x007AC110,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=108 与旧 108 相同。位移 +0x1300，"
         "从 var_multiply 的调用点读出。体内 FUN_1407ab940(vars+8, &entry, hash, name, &value)，"
         "当 `local_10 == '\\0'`（条目已存在）时写 `*(entry + 0x38) = value` —— "
         "与 cvars_get 的读偏移 0x38 **互为印证**。ABI：void fn(vars, name, value)。",
@@ -591,7 +613,8 @@ HELPERS: list[tuple[str, str, int, str]] = [
     (
         "cfp_getvalue",
         "CFixedPointVariableValue::GetValue(CEventScope&) const",
-        0x0034D500,
+        0x0034DF70,
+        "【4.5.3 重定位】字节相似度 0.988（有几处立即数/偏移变了，所以整段字节比对失配）。Ghidra 在 4.5.3 上把 0x34DF70 认成函数起点、函数长度 1470 与 4.5.2 完全相同，反编译语义相似度 0.9968。**身份由调用点确证**：新 var_multiply(0x177C660) 的第 8 个 call 目标就是 0x34DF70，与 4.5.2 里 var_multiply 第 8 个 call 目标 0x34D500 位置完全对应；同函数另外 9 个 call 目标也逐个对上（access_var_pointer / cvars_get x2 / cvars_set / …）。.pdata 起点。位移 +0xA70，"
         "从 var_multiply 的调用点读出（实参是 this+0xf0，MSVC 把该值成员排在 0xf0；"
         "Linux 是 0xe8）。体内按变量值类型分派后把 CFixedPoint 写进 out 槽。"
         "ABI：longlong* fn(this+0xf0, out_slot, scope)，返回 out_slot。",
@@ -599,7 +622,8 @@ HELPERS: list[tuple[str, str, int, str]] = [
     (
         "ship_size_of",
         "CShipSize* —— 从 CBaseDesignImplementation 取当前成长阶段的船体尺寸",
-        0x0030E990,
+        0x0030F330,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=69 与旧 69 相同。位移 +0x9A0，"
         "**护盾/装甲/船体上限做忠实重算的前提。**三个上限函数体内都是 "
         "`lVar9 = FUN_14030e990(param_2)` 然后把这个返回值当 CShipSize 传给 "
         "GetModifierValue —— 所以它就是 Linux 的 "
@@ -613,7 +637,8 @@ HELPERS: list[tuple[str, str, int, str]] = [
     (
         "modifier_value",
         "CShipSize::GetModifierValue(CModifier const&, ModifierType) const",
-        0x00D29DD0,
+        0x00D2F160,
+        "【4.5.3 重定位】掩码字节全等，唯一命中；.pdata 起点 size=312 与旧 312 相同；与 ship_size_max_hp 位移同为 +0x5390，互为旁证。，"
         "**重算链的取值原语。**三个上限函数体内反复出现 "
         "`FUN_140d29dd0(size, &out, mods, type)`，type 就是 ModifierType "
         "（hull 0x1e/0x1f、shield 0x2e/0x2f、armor 0x24/0x25）。"

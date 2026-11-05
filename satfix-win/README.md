@@ -1153,14 +1153,88 @@ $env:SATFIX_WIN_FORCE = '1'          # 触发活体探针
 `SATFIX_WIN_FORCE=1` 同时会绕过必须是 `stellaris.exe` 的检查（给离线自测用），正常游玩
 不要设它。探针只调两个纯函数、不改任何东西，全程有 SEH 包住。
 
-### 游戏更新后
+### 游戏更新后（4.5.3 重定位记录）
+
+游戏升到 **Cygnus v4.5.3**（`stellaris.exe` 构建 `0x6AE49C1B`）时，4.5.2 的地址全部失效。
+这次没有重跑整套原始分析，走的是一条更省、也更硬的路线：**拿旧构建的机器码当密码本做掩码比对**。
+
+1. 4.5.2 时期的 Ghidra 工程（`_analysis/stellaris-c452`）还在，用 pyghidra **只读**打开，
+   把 25 个目标函数的机器码整段取出来 -> `tools/relocate/old_bytes_452.json`；
+2. `tools/relocate/scan_in_new_exe.py`：用 capstone 把 `call`/`jmp` 的 rel32、RIP 相对寻址的 disp32
+   **标记为通配**，其余字节逐个比对新 exe 的 `.text`。命中唯一 = 同一段机器码 = 同一个函数；
+3. `tools/relocate/verify_pdata.py`：再用 PE 的 `.pdata` 异常表独立复核 —— 每个非叶子函数一条
+   `RUNTIME_FUNCTION`，`BeginAddress` 就是编译器给的函数起点，顺便比对函数长度是否与 4.5.2 相同；
+4. 形变的那两个（`diplo_weight` / `ship_size_max_hp`）改用 `tools/relocate/instr_match.py` 的
+   **指令形状相似度**（助记符 + 操作数种类 + 寄存器名，立即数/位移全部折叠）；
+   身份再由 `tools/relocate/callcheck.py` 的**调用点序列**落地；
+5. 最后 `tools/relocate/decomp_453.py` + `compare_decomp.py`：给 4.5.3 跑一遍 Ghidra 分析
+   （785 秒、110,892 个函数），让 Ghidra 在新地址上**自己重新识别函数并反编译**，
+   再与 4.5.2 的 dump 逐函数比语义。这一步不碰字节比对的结果，是独立复核。
+
+| 目标 | 4.5.2 | 4.5.3 | 位移 | 证据 |
+| --- | --- | --- | --- | --- |
+| `cfx_get_rounded` | 0x1B4C170 | 0x1B50CE0 | +0x4B70 | 50B 字节全等，唯一命中 |
+| `cfx_to_fp15` | 0x1B4C0A0 | 0x1B50C10 | +0x4B70 | 87B 全等 |
+| `cfx_get_rounded_fp15` | 0x1B4C100 | 0x1B50C70 | +0x4B70 | 111B 全等 |
+| `cfx_round_to` | 0x1B4C1B0 | 0x1B50D20 | +0x4B70 | .pdata size 282 = 旧 282 |
+| `cfx_atan2` | 0x1B4C2D0 | 0x1B50E40 | +0x4B70 | 810B 全等（.pdata 切成 4 块：8+543+9+250） |
+| `cfx_sqrt` | 0x1B489D0 | 0x1B4D540 | +0x4B70 | .pdata size 686 = 旧 686 |
+| `cfx_safe_sqrt` | 0x1B4C600 | 0x1B51170 | +0x4B70 | .pdata size 573 = 旧 573 |
+| `apply_mul_cfx` | 0x36DF80 | 0x36E990 | +0xA10 | .pdata size 286 = 旧 286 |
+| `apply_mul_fp15` | 0x36E0A0 | 0x36EAB0 | +0xA10 | .pdata size 206 = 旧 206 |
+| `hull_max` | 0xA112A0 | 0xA152E0 | +0x4040 | .pdata size 2784 = 旧 2784 |
+| `shield_max` | 0xA11D80 | 0xA15DC0 | +0x4040 | .pdata size 2960 = 旧 2960 |
+| `armor_max` | 0xA12910 | 0xA16950 | +0x4040 | .pdata size 2558 = 旧 2558 |
+| `damage_per_day` | 0xA14C60 | 0xA18CA0 | +0x4040 | .pdata size 4336 = 旧 4336 |
+| `mpe15` | 0xA0A4A0 | 0xA0E4E0 | +0x4040 | .pdata size 356 = 旧 356 |
+| `mpe7` | 0xA0A610 | 0xA0E650 | +0x4040 | .pdata size 341 = 旧 341 |
+| `var_add` | 0x1777800 | 0x177BF60 | +0x4760 | .pdata size 137 = 旧 137 |
+| `var_multiply` | 0x1777F00 | 0x177C660 | +0x4760 | .pdata size 604 = 旧 604；10 个 call 目标顺序全对 |
+| `diplo_weight` | 0x838670 | 0x839B40 | +0x14D0 | 整段 666B（.pdata 切成 43+74+524+5+20）；前 178 条指令逐条相同 |
+| `ship_size_max_hp` | 0xD2B6E0 | 0xD30A70 | +0x5390 | 指令相似度 0.9941（424 vs 421 条），1858 -> 1870 字节 |
+| `access_var_pointer` | 0x9F7DF0 | 0x9F99B0 | +0x1BC0 | .pdata size 205 = 旧 205 |
+| `cvars_get` | 0x227390 | 0x2272C0 | -0xD0 | .pdata size 217 = 旧 217 |
+| `cvars_set` | 0x7AAE10 | 0x7AC110 | +0x1300 | .pdata size 108 = 旧 108 |
+| `cfp_getvalue` | 0x34D500 | 0x34DF70 | +0xA70 | 函数长度 1470 相同；**身份由调用点确证**（见下） |
+| `ship_size_of` | 0x30E990 | 0x30F330 | +0x9A0 | .pdata size 69 = 旧 69 |
+| `modifier_value` | 0xD29DD0 | 0xD2F160 | +0x5390 | .pdata size 312 = 旧 312；与 ship_size_max_hp 同位移互证 |
+
+**25 个地址里 23 个字节级完全一致**（连函数长度都分毫不差）。形变的两个：
+`diplo_weight` 的收尾被寄存器分配改过（旧版把 rbx 存回栈，新版没有）；
+`ship_size_max_hp` 有一处 `cmp [rax+..], ecx` 被展开成显式分支。
+
+`cfp_getvalue` 是这批里最值得记的一个：整段字节比对只到 0.988（几处立即数/偏移变了），
+指令级相似度仅 0.70，**单看形状不够定身份**。真正落地靠调用点 ——
+新 `var_multiply`（0x177C660）的第 8 个 `call` 目标就是 0x34DF70，与 4.5.2 里第 8 个
+call 目标 0x34D500 位置逐一对应；同函数另外 9 个 call 目标也全部对上。
+
+### 4.5.3 的实机验证记录
+
+`stl launch` 之后 `plugin/logs/satfix.log` 里的关键几行：
+
+- `exe build 0x6AE49C1B（期望 0x6AE49C1B）`
+- `目标: 签名校验通过 19/19，未定位 1（见下），本构建适配 19`
+- `辅助函数: 签名校验通过 6/6（变量系统 EXACT 可用）`
+- 19 条 `hooked <key> @ <addr>`，**无一条被停用**；调用计数持续增长
+  （一分钟内 `Atan2` 110 万、`ApplyModifierMult(cfx)` 40 万、`CalcMax*` 各 4.5 万、
+  `CalcAverageDamagePerDay` 2.4 万、`CShipSize::PostReadInit` 319）
+- 临时打开 `diag_recompute_calls` 后：护盾/装甲/船体的**重算值与游戏值逐位相同**
+  （1000000000 / 180000000 / 580000000，另一条船 20000000 / 10000000 / 20000000），
+  零条「重算≠游戏」告警 —— 说明 `ship_size_of` / `modifier_value` 在 4.5.3 上也取对了值
+- `DIAG HULLMAP size=... base_raw=1000000000 (10000.0000) 命中偏移: 6b8` ——
+  `CShipSize` 的 `max_hitpoints` 偏移在 4.5.3 上**没有漂移**（这条曾在 4.5.2 时期踩过坑，见 §7）
+
+Ghidra 在 4.5.3 上把这 25 个地址**全部**识别为函数入口；反编译语义与 4.5.2 对比：
+10 个完全相同（1.0000），其余 0.91~0.997（`access_var_pointer` 0.8685、`ship_size_max_hp` 0.9105）。
+
+### 下次游戏更新后
 
 ```powershell
 python tools\gen_targets_win.py --check   # 签名/时间戳漂移 -> 非 0 退出
 ```
 
-漂移了就要重新确证 RVA（流程见第 5 节），然后 `tools\gen_targets_win.py` 重新生成，
-并把新的 `exe_timestamps` 加进 `plugin\stl-plugin.json`。
+漂移了就照上面的流程重定位（旧工程 + 掩码比对 + .pdata 复核 + 调用点 + 反编译复核），
+然后 `tools\gen_targets_win.py` 重新生成，并把新的 `exe_timestamps` 换成这次实测的构建。
 
 ---
 
