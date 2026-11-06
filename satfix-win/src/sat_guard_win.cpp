@@ -537,7 +537,7 @@ using FnGetRoundedFp15 = long long* (*)(long long* out, const long long* src);
 
 whk::TypedHook<FnGetRounded> g_hook_get_rounded;
 
-long long detour_get_rounded(const long long* self) {
+extern "C" long long detour_get_rounded(const long long* self) {
     const int idx = kIdxGetRounded;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -570,7 +570,7 @@ long long detour_get_rounded(const long long* self) {
 
 whk::TypedHook<FnToFp15> g_hook_to_fp15;
 
-long long* detour_to_fp15(const long long* src, long long* ret_slot) {
+extern "C" long long* detour_to_fp15(const long long* src, long long* ret_slot) {
     const int idx = kIdxToFp15;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -722,7 +722,7 @@ void shadow_variable(const char* name, const char* op, const void* self, const v
     }
 }
 
-void detour_var_mul(const void* self, const void* scope) {
+extern "C" void detour_var_mul(const void* self, const void* scope) {
     const int idx = kIdxVarMultiply;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -739,7 +739,7 @@ void detour_var_mul(const void* self, const void* scope) {
 //      反编译（FUN_141777800）：写回 `GetValue(self+0xf0) + 条目[+0x38]`，
 //      与 Linux CAddVariableEffect::ExecuteActual 的 `puVar2 + lVar3` 一致（纯加法）。
 //      （g_hook_var_add 的声明在上一节的变量系统公共段里。）
-void detour_var_add(const void* self, const void* scope) {
+extern "C" void detour_var_add(const void* self, const void* scope) {
     const int idx = kIdxVarAdd;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -754,7 +754,7 @@ void detour_var_add(const void* self, const void* scope) {
 
 whk::TypedHook<FnGetRoundedFp15> g_hook_get_rounded_fp15;
 
-long long* detour_get_rounded_fp15(long long* out, const long long* src) {
+extern "C" long long* detour_get_rounded_fp15(long long* out, const long long* src) {
     // ★ 先转原函数、再做记账：这是 OBSERVE 钩子，不需要调用前的状态。
     // 顺序有硬理由 —— 原函数的入参在 rdx，而任何日志/计数调用都可能改写 rdx；
     // 先调原函数，寄存器还是调用方留下的原样，就算将来 ABI 又漂了也不会喂垃圾进去。
@@ -777,7 +777,7 @@ using FnRoundTo = long long (*)(long long* self, const long long* divisor);
 
 whk::TypedHook<FnRoundTo> g_hook_round_to;
 
-long long detour_round_to(long long* self, const long long* divisor) {
+extern "C" long long detour_round_to(long long* self, const long long* divisor) {
     const int idx = kIdxRoundTo;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -805,7 +805,7 @@ using FnAtan2 = long long* (*)(long long* ret, const long long* a, const long lo
 
 whk::TypedHook<FnAtan2> g_hook_atan2;
 
-long long* detour_atan2(long long* ret, const long long* a, const long long* b) {
+extern "C" long long* detour_atan2(long long* ret, const long long* a, const long long* b) {
     const int idx = kIdxAtan2;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -840,7 +840,7 @@ whk::TypedHook<FnSafeSqrt> g_hook_safe_sqrt;
 //
 //  Linux 侧判据：负输入会被当成巨大无符号数去迭代，结果无意义。
 //  这里只判定、只记一行；REPLACE 模式下把输入夹成 0（0 的平方根是 0，语义安全）。
-long long* detour_sqrt(long long* ret, const long long* src) {
+extern "C" long long* detour_sqrt(long long* ret, const long long* src) {
     const int idx = kIdxSqrt;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -869,7 +869,7 @@ long long* detour_sqrt(long long* ret, const long long* src) {
 //
 //  它自己会处理小于安全域下界的输入（乘 100 进域），所以正常路径是安全的；
 //  唯一可疑的仍是负输入。只记一行，不替换。
-long long* detour_safe_sqrt(const long long* src, long long* out) {
+extern "C" long long* detour_safe_sqrt(const long long* src, long long* out) {
     const int idx = kIdxSafeSqrt;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -936,12 +936,12 @@ void shadow_mpe(const char* name, int idx, whk::TypedHook<FnMpe>& hk, long long*
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
 }
 
-long long* detour_mpe15(long long* out, const long long* base, const long long* exp) {
+extern "C" long long* detour_mpe15(long long* out, const long long* base, const long long* exp) {
     shadow_mpe("CalcMilitaryPowerExponent<15>", kIdxMpe15, g_hook_mpe15, out, base, exp);
     return out;
 }
 
-long long* detour_mpe7(long long* out, const long long* base, const long long* exp) {
+extern "C" long long* detour_mpe7(long long* out, const long long* base, const long long* exp) {
     shadow_mpe("CalcMilitaryPowerExponent<7>", kIdxMpe7, g_hook_mpe7, out, base, exp);
     return out;
 }
@@ -965,7 +965,7 @@ whk::TypedHook<FnDiploWeight> g_hook_diplo_weight;
 /// 权重是加权和，正常到 1e6 量级就很夸张了；1e17 只用来抓「明显 wrap 过」的值。
 constexpr long long kDiploWeightSane = 100000000000000000LL;
 
-long long* detour_diplo_weight(const void* self, long long* ret, const void* group) {
+extern "C" long long* detour_diplo_weight(const void* self, long long* ret, const void* group) {
     const int idx = kIdxDiploWeight;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
@@ -1024,7 +1024,7 @@ using FnDamagePerDay = long long* (*)(long long* ret, const void* design, const 
                                       const void* fleet, char a5, void* a6);
 whk::TypedHook<FnDamagePerDay> g_hook_damage;
 
-long long* detour_damage_per_day(long long* ret, const void* design, const void* mods,
+extern "C" long long* detour_damage_per_day(long long* ret, const void* design, const void* mods,
                                  const void* fleet, char a5, void* a6) {
     const int k = kIdxDamagePerDay;
     g_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1710,19 +1710,19 @@ long long* detour_max_hp(const char* name, int idx, whk::TypedHook<FnMaxHp>& hk,
     return r;
 }
 
-long long* detour_shield_max(long long* ret, const void* design, const void* mods,
+extern "C" long long* detour_shield_max(long long* ret, const void* design, const void* mods,
                              const void* fleet, const void* tooltip) {
     return detour_max_hp("CalcMaxShieldHitPoints", kIdxShieldMax, g_hook_shield_max, kRecipeShield,
                          ret, design, mods, fleet, tooltip);
 }
 
-long long* detour_armor_max(long long* ret, const void* design, const void* mods,
+extern "C" long long* detour_armor_max(long long* ret, const void* design, const void* mods,
                             const void* fleet, const void* tooltip) {
     return detour_max_hp("CalcMaxArmorHitPoints", kIdxArmorMax, g_hook_armor_max, kRecipeArmor, ret,
                          design, mods, fleet, tooltip);
 }
 
-long long* detour_hull_max(long long* ret, const void* design, const void* mods, const void* fleet,
+extern "C" long long* detour_hull_max(long long* ret, const void* design, const void* mods, const void* fleet,
                            const void* tooltip) {
     return detour_max_hp("CalcMaxHitPoints", kIdxHullMax, g_hook_hull_max, kRecipeHull, ret, design,
                          mods, fleet, tooltip);
@@ -1809,7 +1809,7 @@ constexpr int64_t kShipSizeMaxHpOff = 0x6b8;
 
 whk::TypedHook<void (*)(void*)> g_hook_ship_size_max_hp;
 
-void detour_ship_size_post_read_init(void* self) {
+extern "C" void detour_ship_size_post_read_init(void* self) {
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[kIdxShipSizeMaxHp].fetch_add(1, std::memory_order_relaxed);
     note_first_call(kIdxShipSizeMaxHp);
@@ -1909,7 +1909,7 @@ void shadow_apply_mul(const char* name, int64_t v0, int64_t m_eff, int64_t v_gam
     }
 }
 
-long long* detour_apply_mul(long long* ret, long long* value, const void* modifier,
+extern "C" long long* detour_apply_mul(long long* ret, long long* value, const void* modifier,
                            int modifier_type, bool stack_flag) {
     const int idx = kIdxApplyMul;
     g_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1941,7 +1941,7 @@ long long* detour_apply_mul(long long* ret, long long* value, const void* modifi
     return r;
 }
 
-long long* detour_apply_mul_fp15(long long* ret, long long* fp15_value, const void* modifier,
+extern "C" long long* detour_apply_mul_fp15(long long* ret, long long* fp15_value, const void* modifier,
                                 int modifier_type, bool stack_flag) {
     const int idx = kIdxApplyMulFp15;
     g_calls.fetch_add(1, std::memory_order_relaxed);
@@ -2197,6 +2197,37 @@ bool is_stellaris_process() {
     return _wcsicmp(name, L"stellaris.exe") == 0;
 }
 
+// ===========================================================================
+// 钩子的「寄存器保全」转发桩（src/detour_stubs.asm）
+//
+// 游戏是 /GL（LTCG）编的：调用方会依赖被调函数**实际不破坏**的易失寄存器
+// （实机证据：`call GetRounded` 之后紧接着 `mov rcx,r10` / `call r11`）。
+// 普通 C detour 会改写 r8-r11，导致 `call r11` 跳到栈地址（c0000005）。
+// 所以安装的是这些汇编桩：保存 rcx/rdx/r8-r11 + xmm0-5 → 调 C 函数体 → 恢复。
+// 桩对寄存器的破坏集 = 空集，永远安全。
+// ===========================================================================
+extern "C" {
+long long satfix_stub_get_rounded(const long long*);
+long long* satfix_stub_to_fp15(const long long*, long long*);
+long long* satfix_stub_apply_mul(long long*, long long*, const void*, int, bool);
+long long* satfix_stub_apply_mul_fp15(long long*, long long*, const void*, int, bool);
+long long satfix_stub_round_to(long long*, const long long*);
+long long* satfix_stub_atan2(long long*, const long long*, const long long*);
+void satfix_stub_var_mul(const void*, const void*);
+void satfix_stub_var_add(const void*, const void*);
+long long* satfix_stub_get_rounded_fp15(long long*, const long long*);
+long long* satfix_stub_shield_max(long long*, const void*, const void*, const void*, const void*);
+long long* satfix_stub_armor_max(long long*, const void*, const void*, const void*, const void*);
+long long* satfix_stub_hull_max(long long*, const void*, const void*, const void*, const void*);
+long long* satfix_stub_sqrt(long long*, const long long*);
+long long* satfix_stub_safe_sqrt(const long long*, long long*);
+long long* satfix_stub_diplo_weight(const void*, long long*, const void*);
+long long* satfix_stub_mpe15(long long*, const long long*, const long long*);
+long long* satfix_stub_mpe7(long long*, const long long*, const long long*);
+long long* satfix_stub_damage_per_day(long long*, const void*, const void*, const void*, char, void*);
+void satfix_stub_ship_size_max_hp(void*);
+}
+
 void install_hooks() {
     // ---- 打开日志（手册 9.1）----
     CreateDirectoryW((plugin_dir() + L"logs").c_str(), nullptr);
@@ -2267,43 +2298,43 @@ void install_hooks() {
             continue;
         }
         if (std::strcmp(t.key, "cfx_get_rounded") == 0)
-            ok = g_hook_get_rounded.install(res[i].addr, &detour_get_rounded);
+            ok = g_hook_get_rounded.install(res[i].addr, &satfix_stub_get_rounded);
         else if (std::strcmp(t.key, "cfx_to_fp15") == 0)
-            ok = g_hook_to_fp15.install(res[i].addr, &detour_to_fp15);
+            ok = g_hook_to_fp15.install(res[i].addr, &satfix_stub_to_fp15);
         else if (std::strcmp(t.key, "var_multiply") == 0)
-            ok = g_hook_var_mul.install(res[i].addr, &detour_var_mul);
+            ok = g_hook_var_mul.install(res[i].addr, &satfix_stub_var_mul);
         else if (std::strcmp(t.key, "var_add") == 0)
-            ok = g_hook_var_add.install(res[i].addr, &detour_var_add);
+            ok = g_hook_var_add.install(res[i].addr, &satfix_stub_var_add);
         else if (std::strcmp(t.key, "cfx_sqrt") == 0)
-            ok = g_hook_sqrt.install(res[i].addr, &detour_sqrt);
+            ok = g_hook_sqrt.install(res[i].addr, &satfix_stub_sqrt);
         else if (std::strcmp(t.key, "cfx_safe_sqrt") == 0)
-            ok = g_hook_safe_sqrt.install(res[i].addr, &detour_safe_sqrt);
+            ok = g_hook_safe_sqrt.install(res[i].addr, &satfix_stub_safe_sqrt);
         else if (std::strcmp(t.key, "diplo_weight") == 0)
-            ok = g_hook_diplo_weight.install(res[i].addr, &detour_diplo_weight);
+            ok = g_hook_diplo_weight.install(res[i].addr, &satfix_stub_diplo_weight);
         else if (std::strcmp(t.key, "mpe15") == 0)
-            ok = g_hook_mpe15.install(res[i].addr, &detour_mpe15);
+            ok = g_hook_mpe15.install(res[i].addr, &satfix_stub_mpe15);
         else if (std::strcmp(t.key, "mpe7") == 0)
-            ok = g_hook_mpe7.install(res[i].addr, &detour_mpe7);
+            ok = g_hook_mpe7.install(res[i].addr, &satfix_stub_mpe7);
         else if (std::strcmp(t.key, "cfx_get_rounded_fp15") == 0)
-            ok = g_hook_get_rounded_fp15.install(res[i].addr, &detour_get_rounded_fp15);
+            ok = g_hook_get_rounded_fp15.install(res[i].addr, &satfix_stub_get_rounded_fp15);
         else if (std::strcmp(t.key, "apply_mul_cfx") == 0)
-            ok = g_hook_apply_mul.install(res[i].addr, &detour_apply_mul);
+            ok = g_hook_apply_mul.install(res[i].addr, &satfix_stub_apply_mul);
         else if (std::strcmp(t.key, "apply_mul_fp15") == 0)
-            ok = g_hook_apply_mul_fp15.install(res[i].addr, &detour_apply_mul_fp15);
+            ok = g_hook_apply_mul_fp15.install(res[i].addr, &satfix_stub_apply_mul_fp15);
         else if (std::strcmp(t.key, "cfx_round_to") == 0)
-            ok = g_hook_round_to.install(res[i].addr, &detour_round_to);
+            ok = g_hook_round_to.install(res[i].addr, &satfix_stub_round_to);
         else if (std::strcmp(t.key, "cfx_atan2") == 0)
-            ok = g_hook_atan2.install(res[i].addr, &detour_atan2);
+            ok = g_hook_atan2.install(res[i].addr, &satfix_stub_atan2);
         else if (std::strcmp(t.key, "shield_max") == 0)
-            ok = g_hook_shield_max.install(res[i].addr, &detour_shield_max);
+            ok = g_hook_shield_max.install(res[i].addr, &satfix_stub_shield_max);
         else if (std::strcmp(t.key, "armor_max") == 0)
-            ok = g_hook_armor_max.install(res[i].addr, &detour_armor_max);
+            ok = g_hook_armor_max.install(res[i].addr, &satfix_stub_armor_max);
         else if (std::strcmp(t.key, "hull_max") == 0)
-            ok = g_hook_hull_max.install(res[i].addr, &detour_hull_max);
+            ok = g_hook_hull_max.install(res[i].addr, &satfix_stub_hull_max);
         else if (std::strcmp(t.key, "damage_per_day") == 0)
-            ok = g_hook_damage.install(res[i].addr, &detour_damage_per_day);
+            ok = g_hook_damage.install(res[i].addr, &satfix_stub_damage_per_day);
         else if (std::strcmp(t.key, "ship_size_max_hp") == 0)
-            ok = g_hook_ship_size_max_hp.install(res[i].addr, &detour_ship_size_post_read_init);
+            ok = g_hook_ship_size_max_hp.install(res[i].addr, &satfix_stub_ship_size_max_hp);
         else {
             logf("目标 %s 没有对应的 detour（目标表与代码不同步）", t.key);
             continue;

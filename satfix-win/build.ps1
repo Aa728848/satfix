@@ -47,6 +47,16 @@ function Invoke-Cl {
     if ($LASTEXITCODE -ne 0) { throw "$What 失败（exit $LASTEXITCODE）" }
 }
 
+# 汇编器：ml64 不在 cl 的自动分派里（cl 会把 .asm 当链接输入），所以单独调。
+function Invoke-Ml {
+    param([string[]]$MlArgs, [string]$What)
+    Write-Host "[build] $What"
+    $inner = 'call "{0}" >nul && ml64.exe {1}' -f $vcvars, ($MlArgs -join ' ')
+    if (-not $vcvars) { $inner = 'ml64.exe ' + ($MlArgs -join ' ') }
+    & cmd.exe /c $inner
+    if ($LASTEXITCODE -ne 0) { throw "$What 失败（exit $LASTEXITCODE）" }
+}
+
 $common = @('/nologo', '/std:c++20', '/MT', '/O2', '/W4', '/EHsc', '/utf-8', "-I`"$Here`"")
 
 # ---- 自测 ------------------------------------------------------------------
@@ -81,11 +91,15 @@ $pluginVersion = $manifest.version
 if (-not $pluginVersion) { throw 'plugin\stl-plugin.json 里没有 version' }
 Write-Host "[build] 清单版本：$pluginVersion"
 
+Invoke-Ml -What '汇编寄存器保全桩（detour_stubs.asm）' -MlArgs @(
+    '/nologo', '/c', "/Fo`"$Out\detour_stubs.obj`"", "`"$Here\src\detour_stubs.asm`""
+)
+
 Invoke-Cl -What "编译插件 DLL（SATFIX_REPLACE=$replaceVal）" -ClArgs ($common + @(
     "/DSATFIX_REPLACE=$replaceVal",
     "/DSATFIX_VERSION=$pluginVersion",    '/DUNICODE', '/D_UNICODE', '/DWIN32_LEAN_AND_MEAN', '/DNOMINMAX',
     "/Fo`"$Out\\`"", "/Fe`"$Out\satfix.dll`"",
-    '/LD', "`"$Here\src\sat_guard_win.cpp`"", '/link', '/INCREMENTAL:NO'
+    '/LD', "`"$Here\src\sat_guard_win.cpp`"", "`"$Out\detour_stubs.obj`"", '/link', '/INCREMENTAL:NO'
 ))
 
 Write-Host "[build] 完成。产物：$Out\satfix.dll"
