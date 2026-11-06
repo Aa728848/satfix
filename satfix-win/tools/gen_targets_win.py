@@ -238,7 +238,16 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
         "在极大输入下 wrap；但 Linux 侧也没为它写精确饱和参考实现（同列为 OBSERVE），"
         "所以这里只计数、不判罚，先看实机有没有异常量级。"
         "意外收获：它紧邻已确证的 GetRounded（0x1B4C170），说明 CFixedPoint 的成员在 "
-        "0x1B4C0A0..0x1B4CE80 成簇排布 —— 这是继续定位其余 CFixedPoint 成员的捷径。",
+        "0x1B4C0A0..0x1B4CE80 成簇排布 —— 这是继续定位其余 CFixedPoint 成员的捷径。"
+        "**★ ABI 勘误（2026-11-06，v0.4.1）**：FUN_141b4c100 的签名是 "
+        "`longlong* (longlong* param_1, ulonglong* param_2)`，体内 "
+        "`uVar1 = *param_2; *param_1 = ...; return param_1;` —— 这是 **sret 两参**："
+        "rcx = 输出槽、rdx = 输入。v0.4.0 按「单参、输入在 rcx」写 detour，"
+        "调用蹦床时只转发 rcx，rdx 被自己的日志调用改写 —— 首次调用就会读到垃圾，"
+        "而该函数正是**科技成本计算**（其调用者 FUN_140426d90 引用 "
+        "TECH_COST_EMPIRE_SIZE / TECH_COST_OVERLORD）用的四舍五入原语，"
+        "所以表现为「游牧国家研究科技 CTD」。修复后探针：0 -> 0、0x8000 -> 100000、"
+        "-0x8000 -> -100000。完整现场见 README §0.3.1。",
     ),
     (
         "shield_max",

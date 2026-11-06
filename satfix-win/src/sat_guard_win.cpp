@@ -511,10 +511,12 @@ int resolve_helpers() {
 //      "数组指针"，因为 Ghidra 把 this 与两个实参混在了一起；本目标的策略是
 //      OBSERVE，**完全不读参数、不依赖这个签名**，只记「被调用过」与心跳。
 //
-//  4) CFixedPoint::GetRounded(fpml const&) —— 非 sret，返回槽在 rax，参数是 fp15 位模式
-//         long long fn(const long long* fp15_bits)
-//      反编译：uVar1 = *param_2; ... 用的是 param_2（不是 this）。
-//      本目标是 OBSERVE：只计数，不判罚（Linux 侧同为 OBSERVE）。
+//  4) CFixedPoint::GetRounded(fpml const&) —— sret，rcx=出参、rdx=源
+//         long long* fn(long long* out /*rcx*/, const long long* fp15_bits /*rdx*/)
+//      反编译（FUN_141b4c100）：`uVar1 = *param_2; ... *param_1 = ...; return param_1;`
+//      —— 入参在 **rdx**，出参在 **rcx**。早先只按单参写，第二个参数裸奔，
+//      会读到垃圾（2026-11-06 游牧局 CTD 的嫌疑之一）。本目标是 OBSERVE：
+//      只计数，不判罚（Linux 侧同为 OBSERVE）。
 //
 //  判定逻辑统一走 satfix_decision.hpp，不在 detour 里各写一份。
 // ===========================================================================
@@ -524,7 +526,14 @@ using FnGetRounded = long long (*)(const long long* self);
 // 所以 C++ 参数顺序是 (src, ret)，别写成 (ret, src)。
 using FnToFp15     = long long* (*)(const long long* src, long long* ret_slot);
 using FnVarMul     = void (*)(const void* self, const void* scope);
-using FnGetRoundedFp15 = long long (*)(const long long* fp15_bits);
+// ABI 由反编译确证（4.5.2 win dump FUN_141b4c100）：
+//     longlong* fn(longlong* out /*rcx*/, const ulonglong* fp15_bits /*rdx*/)
+//     uVar1 = *param_2; *param_1 = ...; return param_1;
+// 这是 **sret 两参**形态：rcx 收结果、rdx 才是源。早先按「单参、源在 rcx」写，
+// 于是 `call(fp15_bits)` 只传了 rcx，rdx 完全裸奔（我们自己的 prologue/log 会改写它）
+// —— 原函数会从垃圾指针读 8 字节，读到什么全看运气。这是 2026-11-06 游牧局
+// CTD 的头号嫌疑，必须按真 ABI 传两个参数。
+using FnGetRoundedFp15 = long long* (*)(long long* out, const long long* src);
 
 whk::TypedHook<FnGetRounded> g_hook_get_rounded;
 
@@ -745,14 +754,17 @@ void detour_var_add(const void* self, const void* scope) {
 
 whk::TypedHook<FnGetRoundedFp15> g_hook_get_rounded_fp15;
 
-long long detour_get_rounded_fp15(const long long* fp15_bits) {
+long long* detour_get_rounded_fp15(long long* out, const long long* src) {
+    // ★ 先转原函数、再做记账：这是 OBSERVE 钩子，不需要调用前的状态。
+    // 顺序有硬理由 —— 原函数的入参在 rdx，而任何日志/计数调用都可能改写 rdx；
+    // 先调原函数，寄存器还是调用方留下的原样，就算将来 ABI 又漂了也不会喂垃圾进去。
+    long long* const r = g_hook_get_rounded_fp15.call(out, src);
+
     const int idx = kIdxGetRoundedFp15;
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
     note_first_call(idx);
     game_thread_pump();
-    // OBSERVE：只计数 + 记录首次调用，不读参数、不判罚
-    const long long r = g_hook_get_rounded_fp15.call(fp15_bits);
     maybe_heartbeat(g_calls.load(std::memory_order_relaxed));
     return r;
 }
@@ -1325,7 +1337,7 @@ int64_t ship_class_mod(const void* design, const void* mods, uint32_t table_rva)
 
 /// 重算的中间量，用于诊断「为什么没报」。
 /// stage: 0=未开始 1=helper 缺失 2=size 为空 3=读 base 失败 4=modifier 返回空
-///        5=完成 6=factor<=0（真值为负，按 Linux 同款跳过）
+///        5=完成 6=factor<=0（真值为负，按 Linux 同款跳过）7=design 不像真对象（拒绝虚调用）
 struct MaxHpDetail {
     int     stage = 0;
     int64_t base_raw = 0, add_in = 0, add_mul = 0, cls_base = 0, cls_mul = 0;
@@ -1333,6 +1345,28 @@ struct MaxHpDetail {
     int64_t factor = 0, sat = 0;
     const void* size = nullptr;   ///< ship_size_of(design)，诊断用
 };
+
+/// design 是否像一个构造完整的游戏对象：首字段（vtable）落在 stellaris.exe 映像内。
+///
+/// 为什么必须先验：`recompute_max_hp` 的第一步是 `ship_size_of(design)`，它是
+/// **虚调用**（`(**(code **)(*design + 0x10))()`）。数据库加载期游戏会拿栈上的
+/// 假指针调上限函数（实测 mods = 0x7FEFF0），若 design 也是假的，读到的
+/// vtable 就是一段栈数据，`+0x10` 取出来的"函数指针"同样是栈地址 ——
+/// 一跳就是 `c0000005`（执行栈），2026-11-06 游牧局 CTD 的现场正是这种形态。
+/// 这里只做最便宜的合法性检查（可为空的 8 字节对齐 + vtable 在镜像内）；
+/// 不像真对象就**跳过重算**（宁可漏报，不可崩游戏）。
+bool design_has_plausible_vtable(const void* design) {
+    if (design == nullptr) return false;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(design);
+    if (p < 0x10000 || (p & 7) != 0) return false;
+    const void* vtbl = nullptr;
+    if (!whk::safe_read(&vtbl, design, sizeof vtbl) || vtbl == nullptr) return false;
+    const uintptr_t v = reinterpret_cast<uintptr_t>(vtbl);
+    const uintptr_t base = whk::image_base();
+    // 4.5.3 的映像约 0x37F8000 字节；给到 64 MB 足够，且能排除栈/堆上的假 vtable。
+    if ((v & 7) != 0 || v < base || v >= base + 0x4000000ull) return false;
+    return true;
+}
 
 bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods, int64_t* out,
                       MaxHpDetail* d) {
@@ -1345,6 +1379,11 @@ bool recompute_max_hp(const MaxHpRecipe& r, const void* design, const void* mods
     }
     if (design == nullptr || mods == nullptr || out == nullptr) {
         if (d) d->stage = 1;
+        return false;
+    }
+    // ★ 虚调用前的最后一道闸：design 必须像个真对象（见上）。
+    if (!design_has_plausible_vtable(design)) {
+        if (d) d->stage = 7;
         return false;
     }
 
@@ -2022,14 +2061,15 @@ void run_live_probe() {
         logf("探针 to_fp15 跳过：该钩子没装上");
     }
 
-    // ---- GetRounded(fp15): OBSERVE，只确认能被调用 ----
+    // ---- GetRounded(fp15): OBSERVE，只确认能被调用（ABI：rcx=出参, rdx=源）----
     if (g_hook_get_rounded_fp15.trampoline() != nullptr) {
         const int64_t fp15_bits[] = {0, 0x8000, -0x8000};
         for (int64_t bits : fp15_bits) {
             __try {
-                const long long got = detour_get_rounded_fp15(&bits);
+                int64_t out = 0;
+                detour_get_rounded_fp15(&out, &bits);
                 logf("探针 GetRounded(fp15) bits=0x%llx -> %lld（OBSERVE，值本身不作判据）",
-                     (unsigned long long)bits, (long long)got);
+                     (unsigned long long)bits, (long long)out);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 logf("探针 GetRounded(fp15) bits=0x%llx -> 异常 0x%08lX",
                      (unsigned long long)bits, GetExceptionCode());
