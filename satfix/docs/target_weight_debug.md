@@ -1,88 +1,74 @@
-# debug_target_weight：ImGui 索敌权重窗口
+# debug_target_weight：实验性 ImGui 索敌权重窗口（Linux）
 
-## 不用注入 ImGui
+> 本模块为 `satfix/`（Linux 侧）的实验性调试功能，位于 [`../debug_ui.hpp`](../debug_ui.hpp)，仅在设置环境变量 `SATFIX_TARGET_WEIGHT=1` 时展开窗口。
 
-群星自带 ImGui，OpenGL3 后端，而且符号全部导出（`nm -C | grep -c ImGui` = 1134）。
-所以要做的只是 hook 它每帧的 `NewFrame`，在它之后画自己的窗口。
+---
 
-顺带纠正一个常见误解：游戏里那个 `imgui` 控制台命令（`OnExecute_ImGui` @0x2c4e9a0）
-是它自己的一套 debug UI 注册表（`SImGuiSubCommandEntry` / `SImGuiUiEntry`），
-和我们要加的窗口是两回事，不必去改它的表。
+## 1. 原理：直接复用游戏内置 ImGui
 
-### 用到的 ImGui 入口（mangled 名已核实）
+Linux 版 Stellaris 自带 ImGui（OpenGL3 后端）并完整导出符号（`nm -C | grep -c ImGui` = 1134），因此无需自行注入一套 ImGui，只需 hook `ImGui::NewFrame`，在原函数执行之后绘制自定义窗口即可。
 
-| 符号 | 地址 |
-| --- | --- |
-| `_ZN5ImGui8NewFrameEv` | 0x3f1d620 |
-| `_ZN5ImGui5BeginEPKcPbi` | 0x3f22680 |
-| `_ZN5ImGui3EndEv` | 0x3f297b0 |
-| `_ZN5ImGui15TextUnformattedEPKcS1_` | 0x3f93510 |
-| `_ZN5ImGui9SeparatorEv` | 0x3f96d70 |
-| `_ZN5ImGui8CheckboxEPKcPb` | 0x3f95bc0 |
-| `_ZN5ImGui11SmallButtonEPKc` | 0x3f94910 |
-| `_ZN5ImGui17SetNextWindowSizeERK6ImVec2i` | 0x3f22650 |
+> 注：游戏控制台命令 `imgui`（`OnExecute_ImGui`）对应的是引擎内部的 debug UI 注册表（`SImGuiSubCommandEntry` / `SImGuiUiEntry`），与直接调用导出的 ImGui 绘制 API 无关。
 
-`ImGui::NewFrame()` 在游戏里只有一个调用点，位于 `NImGuiWrapper::ImGuiNewFrame`（反编译 8570241）。
-hook ImGui 自己的 `NewFrame` 比 hook 那个 wrapper 更稳，不受 LTO 影响。
+已核实的 ImGui 导出入口（Cygnus v4.5.2）：
 
-## 已实现（`debug_ui.hpp`）
+| 符号 | 4.5.2 静态地址参考 |
+| --- | :---: |
+| `_ZN5ImGui8NewFrameEv` | `0x3f1d620` |
+| `_ZN5ImGui5BeginEPKcPbi` | `0x3f22680` |
+| `_ZN5ImGui3EndEv` | `0x3f297b0` |
+| `_ZN5ImGui15TextUnformattedEPKcS1_` | `0x3f93510` |
+| `_ZN5ImGui9SeparatorEv` | `0x3f96d70` |
+| `_ZN5ImGui8CheckboxEPKcPb` | `0x3f95bc0` |
+| `_ZN5ImGui11SmallButtonEPKc` | `0x3f94910` |
+| `_ZN5ImGui17SetNextWindowSizeERK6ImVec2i` | `0x3f22650` |
 
-- hook `ImGui::NewFrame`，调原函数之后画 `debug_target_weight` 窗口；
-- 窗口内容：标题、两个勾选框、`立即计算` 按钮、数据区；
-- 默认值：手动触发（定期计算默认不勾），不显示组件级权重（默认不勾）；
-- 环境变量 `SATFIX_TARGET_WEIGHT=1` 会在启动时把窗口打开；
-- 任何一个 ImGui 符号解析不到，整个模块就不启用，打印一行原因，不影响游戏。
+`ImGui::NewFrame()` 在游戏内唯一调用点是 `NImGuiWrapper::ImGuiNewFrame`；直接 hook `ImGui::NewFrame` 可避免受 LTO 内联影响。
 
-```bash
-SATFIX_TARGET_WEIGHT=1 LD_PRELOAD=./sat_guard.so ./cream.sh ./stellaris
+---
+
+## 2. 当前已实现
+
+- 拦截 `ImGui::NewFrame`，在原函数返回后渲染 `debug_target_weight` 窗口；
+- 窗口包含标题、两个复选框（「定期计算」「显示组件级权重」，默认均不勾选）、「立即计算」按钮与数据显示区；
+- 启动开关：
+  ```bash
+  SATFIX_TARGET_WEIGHT=1 LD_PRELOAD=/abs/path/to/satfix/sat_guard.so ./stellaris
+  ```
+- 安全降级：任一 ImGui 符号解析失败时，整个调试模块自动停用并打印一行日志，不影响游戏和主溢出守卫功能。
+
+---
+
+## 3. 待完成事项（TODO）
+
+### TODO 1：注册游戏控制台命令 `debug_target_weight`
+
+控制台命令注册机制参考 `SetupLocalizationConsoleCommands()`（4.5.2 反编译 8694035）：
+
+```cpp
+CConsoleCmdManager* mgr = CConsoleCmdManager::_pInstance;
+if (!mgr) { CConsoleCmdManager::CreateInstance(); mgr = _pInstance; }
+CConsoleCmd::SCommandData data;        // 0xa8 字节
+memcpy(&data, &existing_template, 0xa8);
+CConsoleCmdManager::AddCommand(mgr, &data);
 ```
 
-## TODO 1：控制台命令 `debug_target_weight`
+可选实现路线：
+1. **复制模板（推荐）**：拷贝现有命令（如 `imgui`）的静态 `SCommandData`，仅替换命令名与回调函数指针后注册，避免逆向完整 `0xa8` 结构；
+2. **手动构造**：借助 `CConsoleCmd::GetCommandSyntaxDesc` 与 `CopyToNewCommandStructure` 逆出完整字段布局。
 
-游戏的控制台命令注册机制已经找到，样板在 `SetupLocalizationConsoleCommands()`（反编译 8694035）：
+回调签名固定为 `CConsoleCmd::SResult OnExecute_XXX(CPdxArray<CString, int> const&)`，在回调中切换 `satfix_ui::g_window_open` 即可。
 
-```c
-CConsoleCmdManager* mgr = CConsoleCmdManager::_pInstance;          // @0x6178878
-if (!mgr) { CConsoleCmdManager::CreateInstance(); mgr = _pInstance; }   // @0x4221790
-CConsoleCmd::SCommandData data;                                     // 0xa8 字节
-memcpy(&data, &DAT_0551c7b0, 0xa8);                                 // 从静态模板拷
-CConsoleCmdManager::AddCommand(mgr, &data);                         // @0x4221850（按引用传）
-```
+### TODO 2：接入索敌权重数据源
 
-两条可选路线：
+候选目标函数（4.5.2）：
 
-1. **抄模板**（推荐）：把现有命令（比如 `imgui`）的 `SCommandData` 拷一份，改掉 name 字段与 handler 指针，再 `AddCommand`。不用逆整个 0xa8 布局。需要先定位 `imgui` 命令的静态 `SCommandData`（`DAT_0551c7b0` 这类地址之一）。
-2. **自己填结构**：要先逆清 `SCommandData` 的字段（可用 `CConsoleCmd::GetCommandSyntaxDesc` @0x429c360 与 `CopyToNewCommandStructure` @0x429c680 反推），成本高。
+| 函数 | 4.5.2 静态地址参考 |
+| --- | :---: |
+| `CShipTargeting::ComputePotentialTargetScore(CShip const*, SSinglePotentialShipData const&, SSinglePotentialTargetData const&, CFixedPoint&, bool, CString*)` | `0x2088d60` |
+| `CWeaponComponentTargeting::ComputePotentialTargetScore(CWeaponComponent const&, SShipComponentMicroUpdateConstData const&, SSinglePotentialShipData const&, SSinglePotentialTargetData const&)` | `0x208b0f0` |
 
-handler 签名是固定的：`CConsoleCmd::SResult OnExecute_XXX(CPdxArray<CString,int> const&)`。
-我们只关心有没有参数，返回成功。命令里切换 `satfix_ui::g_window_open` 即可。
-
-## TODO 2：索敌权重数据源（主要工作量）
-
-候选函数都已定位：
-
-| 函数 | 地址 |
-| --- | --- |
-| `CWeaponComponentTargeting::ComputePotentialTargetScore(CWeaponComponent const&, SShipComponentMicroUpdateConstData const&, SSinglePotentialShipData const&, SSinglePotentialTargetData const&)` | 0x208b0f0 |
-| `CShipTargeting::ComputePotentialTargetScore(CShip const*, SSinglePotentialShipData const&, SSinglePotentialTargetData const&, CFixedPoint&, bool, CString*)` | 0x2088d60 |
-
-障碍是两个入参结构：`SSinglePotentialShipData` / `SSinglePotentialTargetData`（以及武器的
-`SShipComponentMicroUpdateConstData`），布局还没逆。
-
-建议的推进顺序是先找 `CWeaponComponentTargeting` 的调用点，也就是战斗微更新里生成
-候选目标的地方，从那里反推这两个结构的字段含义与填充来源。然后先只做舰船级的
-`CShipTargeting::ComputePotentialTargetScore`，组件级留到第二步，正好对应「默认不显示
-组件权重」这个默认值。数据来源用当前选中舰队加其敌对舰队：`CFleet` 的舰船数组，
-`CCountry::IsHostileCached` 之类的现成函数（前面战斗分析里都见过）。
-
-约束是只读、每帧最多算一次：定期计算默认关闭，手动按钮触发一次；勾了定期计算才每 N 帧
-算一次（N 待定，建议 ≥ 60 帧，避免影响帧率）。
-
-## 需要你配合的事
-
-- 测的时候先只验证窗口能不能出来（`SATFIX_TARGET_WEIGHT=1`），确认控件能点、能勾、
-  不崩、不掉帧。这一步与数据源无关，先把渲染链路打通。
-- 如果窗口出不来，把 stderr 里那行 `ImGui 入口没解析全` 或 `hook ImGui::NewFrame 失败`
-  发我（说明符号名或调用时机需要调整）。
-- 数据源部分需要一条具体场景：哪个存档、哪场战斗、想看哪两方的权重。我按那条链路去逆
-  结构，比盲逆快得多。
+后续推进方向：
+1. 从战斗微更新调用点反推 `SSinglePotentialShipData`、`SSinglePotentialTargetData` 与 `SShipComponentMicroUpdateConstData` 的字段布局；
+2. 先接入舰船级权重计算（遍历当前选中 `CFleet` 及其敌对舰队，借助 `CCountry::IsHostileCached` 过滤），再补充武器组件级权重；
+3. 严格只读并限频：默认仅手动按钮触发，定期刷新间隔建议 ≥ 60 帧，避免拖慢帧率。

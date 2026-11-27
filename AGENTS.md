@@ -10,14 +10,18 @@
 
 同一份逻辑有两个平台实现，**改一个必须考虑另一个**：
 
-| 目录 | 平台 | 形态 |
-| --- | --- | --- |
-| `satfix/` | Linux | `LD_PRELOAD` 共享库（`sat_guard.so`），靠 `dlsym` + 符号名定位 |
-| `satfix-win/` | Windows | Stellaris Launcher 插件 DLL（`satfix.dll`），靠硬编码 RVA + 序言签名定位 |
-| `hooklib/` | 共用 | Linux 侧的 hook 引擎（`shk`）；Windows 侧是自带的 `winhook.hpp` |
+| 目录 | 平台 | 形态 | 当前适配 |
+| --- | --- | --- | --- |
+| `satfix-win/` | Windows | Stellaris Launcher 插件 DLL（`satfix.dll`），靠硬编码 RVA + 序言签名定位 | **Cygnus v4.6.0**（build `0x6AF6BDEC`，插件 `v0.5.0`） |
+| `satfix/` | Linux | `LD_PRELOAD` 共享库（`sat_guard.so`），靠 `dlsym` + 符号名定位 | Cygnus v4.5.2（尚未同步 4.6.0 与部分新目标） |
+| `hooklib/` | Linux 共用 | Linux 侧的 hook 引擎（`shk.hpp`）；Windows 侧是自带的 `winhook.hpp` | — |
 
-游戏版本：**Cygnus v4.5.3**，`stellaris.exe` build 时间戳 `0x6AE49C1B`（4.5.2 是 `0x6ABEAA3F`，
-当年那套地址与 dump 都还在，重定位流程见 `satfix-win/README.md` 的「游戏更新后」）。
+历史构建时间戳参考：
+- **v4.6.0**：`0x6AF6BDEC`（当前主力，`satfix-win/src/satfix_targets_win.generated.hpp` 指向此构建）
+- **v4.5.3**：`0x6AE49C1B`
+- **v4.5.2**：`0x6ABEAA3F`
+
+游戏更新后的重定位流程见 [`satfix-win/tools/relocate/README.md`](satfix-win/tools/relocate/README.md)。
 
 ---
 
@@ -31,94 +35,93 @@ Windows 的 `stellaris.exe` 被 strip 过：
 
 | 项 | 值 |
 | --- | --- |
-| 导出符号 | 110 个（几乎全是 PhysicsFS，**拿不到任何游戏函数**） |
+| 导出符号 | ~110 个（几乎全是 PhysicsFS/CRT，**拿不到任何游戏函数**） |
 | C++ 符号 | **无** |
 | PDB | **无** |
-| `.pdata` | 134803 个函数，**只有地址区间，没有名字** |
+| `.pdata` | 13 万~14 万+ 个函数（4.6.0 实测 142,256 个），**只有地址区间，没有名字** |
 | RTTI | 1269 条类名（只能给类，给不了非虚成员地址） |
 
-而 **Linux 版二进制保留了完整符号表**（139641 个函数块，99.9993% 有名）。
+而 **Linux 版二进制保留了完整符号表**（近 14 万个函数块，99.999% 有名）。
 
-两份 dump 是**同一个 build**（同 commit、同版本串），所以**同一个函数在两边的「形状」是一致的**：
-函数体逻辑、独占常量、ModifierType 序列、调用结构 —— 这些都能跨平台对照。
+同版本的两份二进制来自同一次发布构建，所以**同一个函数在两边的逻辑形状、独占常量、ModifierType 序列与调用结构是一致的**，必须跨平台对照定位。
 
 ### 源码库在哪（**不在本仓库内**，体量太大）
 
-相对于本仓库上级目录：
+相对于本仓库上级目录（`../`）：
 
-| 文件 | 大小 | 说明 |
-| --- | --- | --- |
-| `../stellaris_4.5.2_source.cpp` | 339 MB | **Linux 4.5.2 反编译，有完整符号名** —— 主力参考 |
-| `../_analysis/stellaris_4.5.2_win_source.cpp` | 173 MB | Windows 4.5.2 反编译，**只有 `FUN_xxxxxxxx`** |
-| `../_analysis/stellaris_4.5.2_win_symbolized.cpp` | 173 MB | 上一份的「回填符号名」版（见下方警告） |
-| `../stellaris_4.5_source.cpp` / `../_analysis/stellaris_4.5_win_source.cpp` | 304/173 MB | 4.5.0 版本，做版本漂移对照用 |
-| `../_analysis/win_linux_mapping_final_452.json` | 1.1 MB | 10186 对 `FUN_ → Linux 名` 映射 |
-| `../_analysis/_ndefines_thunks.json` | 158 KB | 2369 条 `(NDefines 名, 组, 全局地址)` |
+| 文件 | 说明 |
+| --- | --- |
+| `../stellaris_4.6_source.cpp` | **Linux 4.6 反编译，有完整符号名** —— 4.6 适配期主力参考（配合 `tools/relocate/locate46.py` 建索引） |
+| `../stellaris_4.5.2_source.cpp` | Linux 4.5.2 反编译（339 MB，历史对照基准） |
+| `../_analysis/stellaris_4.5.2_win_source.cpp` | Windows 4.5.2 反编译（173 MB，只有 `FUN_xxxxxxxx`） |
+| `../_analysis/stellaris_4.5.2_win_symbolized.cpp` | 上一份的「回填符号名」版（见 §9 警告：不要轻信映射名） |
+| `../stellaris_4.5_source.cpp` / `../_analysis/stellaris_4.5_win_source.cpp` | 4.5.0 版本，做版本漂移对照用 |
+| `../_analysis/win_linux_mapping_final_452.json` | 10186 对 `FUN_ → Linux 名` 字符串指纹映射（仅供参考，不可当身份证明） |
+| `../_analysis/_ndefines_thunks.json` | 2369 条 `(NDefines 名, 组, 全局地址)`（4.5.2） |
 
 dump 格式（两份一致，`// ==== <name> End ====` 分隔）：
 
-```
+```cpp
 <body 在前>
 // ============ FUN_140a14c60 End ===============
 <空行 ×3>
 ```
 
-**解析要点**：函数体在**分隔行之前**。写解析脚本时容易 off-by-one（把名字配到下一个函数体上），
-第一次读某函数时**先打印它的签名行确认**（`longlong * FUN_xxx(...)`）。
+**解析要点**：函数体在**分隔行之前**。写解析脚本时容易 off-by-one（把名字配到下一个函数体上），第一次读某函数时**先打印它的签名行确认**（`longlong * FUN_xxx(...)`）。
 
 ### 标准定位流程（照这个做）
 
-1. **在 Linux dump 里按符号名找到目标函数**，读它的完整函数体。
+1. **在对应版本的 Linux dump 里按符号名找到目标函数**，读它的完整函数体。
+   - ⚠️ **注意版本位移**：大版本升级（如 4.5.3 → 4.6.0）会整体平移 `ModifierType` 枚举值、改变元数据表寻址方式或改写容器结构。**不要拿旧版本的 ModifierType 编号直接搜新版 exe**，必须先从**新版 Linux dump** 重读。
 2. **提取跨平台指纹**，按可靠性排序：
-   - **独占常量**（最强）：只在少数函数里出现的魔数。例：
-     `0xb50679d3` 是 `CalcAverageDamagePerDay` 独有的安全界；
-     `0x1614c/0x16158/0x16208/0x162b8` 是护盾专用的 ModifierType 集合。
-   - **ModifierType 序列**（很强）：函数依次取哪些 `GetModifierValue` 的 type 号。
-     实测 `0x3a/0x40/0x168/0x41/0x1d2/0x1d3/0x230` 这一串 7 个全同且同序，是决定性证据。
-   - **结构偏移**：读 `param_2 + 0xNNN` 这种。**注意 MSVC 与 GCC 布局会不同**，只能当辅助。
-   - **调用者/被调用者**：见下。
-3. **在 Windows dump 里按指纹筛候选**，逐个读函数体确认。
+   - **独占字符串**（极强）：报错/诊断字符串在 exe 中往往唯一命中。
+   - **ModifierType 立即数序列 / 对**（极强）：例如 `mov r9d, <type_add>` 与 `mov r9d, <type_mul>` 同时出现在同一函数中，或 7 个 ModifierType 同序传给 `GetModifierValue`。
+   - **独占常量**（很强）：仅在极少数函数中出现的魔数或行号常量。
+   - **调用者 / 被调用者序列**（很强）：从已确证函数顺藤摸瓜。
+   - **`.pdata` 分块形状**：如 `diplo_weight` 跨版本保持 `43/74/524/5/20` 分块。
+   - **结构偏移**（最弱，仅作辅助）：MSVC 与 GCC 布局经常不同，**绝对不能照抄**。
+3. **在 Windows exe / dump 里按指纹筛候选**，反汇编或反编译确认函数体与 `.pdata` 起点。
+   - 游戏小版本更新优先走 `tools/relocate/` 的**掩码字节比对**（旧版机器码通配 rel32/disp32 后扫新 `.text`）；大版本形变目标改用 `tools/relocate/locate46.py` 走上述指纹法。
 4. **【必做】核对 ABI —— 看调用点，不是看函数体**（见 §2）。
-5. 把结论加进 `satfix-win/tools/gen_targets_win.py` 的 `CONFIRMED` 表（格式 `(key, desc, rva, strat, evidence)`，5 个字段 —— 序言签名由脚本从 exe 现读，不用手写），
-   然后 `python tools/gen_targets_win.py` 重新生成头文件。
+5. 把结论更新到 `satfix-win/tools/gen_targets_win.py`：
+   - 历史 4.5.3 表为 `CONFIRMED` / `HELPERS`，4.6.0 采用 `RVA_46` / `EVIDENCE_46` 覆盖表；序言签名由脚本从目标 exe 现读，禁止手写；
+   - 运行 `python satfix-win\tools\gen_targets_win.py` 重新生成 `src/satfix_targets_win.generated.hpp`。
 
 ### 定位手段（按实战效果排序）
 
-1. **调用者法** —— 用 Linux 侧「谁调用 X」的名单，去找 Windows 侧调用同一批函数的那个函数。
-   `apply_mul_cfx`、`cfx_sqrt` 都是这么定出来的。
-2. **NDefines 名字法** —— Paradox 的 `NDefines` 名字字符串存在于 exe 的 `.rdata`，
-   扫 `.text` 找 rip-relative 引用，能读出「名字 → 全局地址」；
-   再找「同时读这些全局」的函数。`diplo_weight`、`mpe15`/`mpe7` 靠它破局。
-3. **片区扫** —— 已知函数常在同一个命名空间里连续排布。三个上限函数在 `0xA112A0`~`0xA12910`，
-   于是扫 `0xA00000..0xA20000` 就找到了伤害函数 `0xA14C60`。**这条救过一次错误定位。**
-4. **常量指纹** —— 见上。
+1. **掩码字节比对**（版本更新首选）—— 取旧构建机器码，把 `call/jmp` 的 `rel32` 和 RIP 相对寻址 `disp32` 标记为通配，扫新 `.text` + `.pdata` 复核。小版本命中率 >90%，大版本也能先捞回约一半不变函数。
+2. **立即数落寄存器检索 / ModifierType 序列** —— `locate46.py scan-imm-fn` 找 `mov r9d, imm` 组合，三个上限与伤害函数全库唯一命中。
+3. **调用者法** —— 用 Linux 侧「谁调用 X」的名单找 Windows 侧调用点（如 `CalcStarbaseCapacity` 定位 `ApplyModifierMult`）。
+4. **NDefines 名字法** —— 从 `.rdata` 的 `NDefines::<组>::<名>` 字符串反查 `.text` 里的 5 指令注册 thunk，从 `r9` 读出全局地址，再查读该全局的函数（`diplo_weight`、`mpe15`/`mpe7` 靠它破局）。
+5. **片区扫** —— 同命名空间函数往往相邻排布（如 `NShipUtil` 片区）。
 
 ### 已证伪的思路（别重走）
 
-- **调用图传播**：精度只有 12–26%，不可用（枢纽函数吸票）。
-- **字段偏移结构指纹**：单独用精度 ~18%。
-- **按函数体形状找 `apply_mul_cfx`**：Windows 里有 75 个函数含同一套 CModifier 惯用法，常量分不开，必须看调用点。
+- **调用图传播**：精度只有 12–26%，枢纽函数吸票，不可用。
+- **字段偏移结构指纹**：单独用精度 ~18%，且跨编译器极易漂移。
+- **按常量形状找 `apply_mul_cfx`**：Windows 里有 75 个函数含同一套 CModifier 惯用法，常量分不开，必须看调用点。
+- **拿旧版 `0xb50679d3` 全库搜 `damage_per_day`**：4.5.2 时命中了单件武器层而非总计层，4.6.0 该常量已变为 `0xb504f333`。
 
 ---
 
 ## 2. ★ 第二条：函数体一样 ≠ ABI 一样
 
-**每次都要看调用点确认参数含义。** 这不是理论风险，已经踩过多次：
+**每次都要看调用点确认参数个数、参数顺序和返回方式。** 历史已踩过六次大坑（详录见 [`satfix-win/docs/ENGINEERING_NOTES.md`](satfix-win/docs/ENGINEERING_NOTES.md)）：
 
 | 踩坑 | 症状 | 原因 |
 | --- | --- | --- |
-| `FUN_14075a370` 被当成 `operator fpml` | 活体探针四个输入全返回同一常数 `1767657313` | 函数体一样，但 rdx 其实是个**缩放标量**，不是返回槽 |
-| `cfx_to_fp15` | 第一次按「rdx=源、rcx=返回槽」写，探针全 0 | 参数顺序反了；正确是 `rcx=源, rdx=返回槽` |
-| `mpe15` vs Linux | — | **参数顺序相反**（Linux 是 `(out, 指数, 底数)`，Windows 是 `(out, 底数, 指数)`） |
-| `FUN_1403c2910` 被当成伤害函数 | 装了、调用 13000 次，但一个 EVENT 都没触发 | 它是「单件武器」那层；真正的伤害总计是 `0xA14C60` |
-| `detour_max_hp` 读错返回位置 | 以为三个上限函数「返回全是 0」 | 实际是读错了位置；实机日志证明它们返回真实值 |
+| `FUN_14075a370` 当成 `cfx_to_fp15` | 活体探针四输入全返回常数 `1767657313` | 函数体公式相同，但 `rdx` 实际是缩放标量，不是返回槽 |
+| `cfx_to_fp15` 参数反序 | 探针全返回 0 | 实际为 `(src=rcx, ret=rdx)`，非 `(ret, src)` |
+| `SafeSqrt` 与 `Sqrt` 反序 | 探针恒返回哨兵值 `0x5A5A...` | 同类兄弟函数参数顺序相反：`Sqrt(out, src)` vs `SafeSqrt(src, out)` |
+| `mpe15` / `mpe7` 跨平台反序 | — | Linux 为 `(out, exp, base)`，Windows 为 `(out, base, exp)` |
+| `GetRounded(fp15)` 少传一参 | 探针返回垃圾值 | sret 两参 `(out=rcx, src=rdx)`，误写成单参导致 `rdx` 被日志调用破坏 |
+| `detour_max_hp` 读错返回槽 | 误以为三上限返回 0 | 读错了 sret 槽位 |
 
-**教训**：写 detour 前，把调用点的 `FUN_xxx(args...)` 那一行读出来，逐个参数核对。
+**教训**：写 detour 前，必须把调用点的汇编或反编译 `FUN_xxx(args...)` 读出来，逐个寄存器和栈参核对。
 
-### 还有第三层契约：**破坏集（clobber set）**
+### 第三层契约：**破坏集（clobber set）**
 
-4.5.3 是 MSVC `/GL`（LTCG）编译的。LTCG 会按「函数**实际**写了哪些寄存器」做寄存器分配，
-而不是按标准 ABI 的 caller-saved 上限。实机抓到的现行证据（RVA `0xFC5BCC`）：
+`stellaris.exe` 使用 MSVC `/GL`（LTCG，全程序优化）编译。LTCG 会按被调函数**实际修改的寄存器**做调用方寄存器分配，而非标准 x64 ABI 的 caller-saved 上限。实机抓到的现行证据（4.5.3 RVA `0xFC5BCC`）：
 
 ```asm
 call 0x141B50CE0      ; GetRounded（已钩）
@@ -127,28 +130,27 @@ mov  rcx, r10         ; 调用后继续用 r10
 call r11              ; 调用后继续用 r11
 ```
 
-`GetRounded` 只碰 `rax/rcx/rdx`，所以调用方敢把值放 `r10/r11` 跨调用用。
-**我们的 detour 只要比原函数多破坏一个寄存器，就会在某个调用点炸成「跳到栈上执行」**
-（`c0000005`，故障地址是栈地址；两次实机 CTD 都是这个形态）。
+`GetRounded` 只碰 `rax/rcx/rdx`，所以调用方将活跃值留在 `r10/r11` 跨调用使用。**只要我们的 C detour 比原函数多破坏一个易失寄存器，就会在某个调用点炸成 `c0000005`（跳到栈上执行 / DEP 违规）。**
 
-所以：**detour 必须做到「破坏集 ⊆ 原函数破坏集」**。最省事也最稳的做法不是逐个分析，
-而是装一个汇编转发桩：进入时保存 `rcx/rdx/r8-r11 + xmm0-5`，返回前恢复
-（见 `satfix-win/src/detour_stubs.asm`）。**新增钩子时必须同步加桩**，
-否则又是一个偶发 CTD。
+**硬性规约**：
+- 所有 Windows 侧钩子**必须通过汇编转发桩**（`satfix-win/src/detour_stubs.asm`）安装；
+- 桩进入时保存全部易失寄存器（`rcx/rdx/r8-r11` + `xmm0-5`）、转发第 5/6 栈参、调用 C 函数体、返回前原样恢复，使钩子对调用方的破坏集为**空集**；
+- **新增或删除钩子时，必须同步维护 `detour_stubs.asm` 并在 `install_hooks()` 中安装对应的 `satfix_stub_*`**。
 
 ---
 
-## 3. 本地化新目标的验收标准
+## 3. 本地化新目标或版本重定位的验收标准
 
-一个目标只有满足这些才算「确证」，缺一不可：
+缺一不可：
 
-1. **RVA 有依据**（调用点 / 独占常量 / 邻居位置，写进 `evidence` 字段）
-2. **序言签名**已生成（`gen_targets_win.py` 自动从 exe 读 16 字节）
-3. **ABI 有调用点证据**（不是靠函数体猜）
-4. **实机验证**：`stl launch` 后日志里出现 `hooked <key> @ <addr>`，且**目标函数被实际调用**（`首次调用: <name>`）
-5. **判据有实机证据**：要么抓到真实的 EVENT，要么用活体探针证明检出链通了
+1. **RVA 有可复核依据**（掩码比对 / 调用点 / ModifierType 立即数 / 独占串，写进 `gen_targets_win.py` 的证据字段）；
+2. **序言签名已自动生成**（`gen_targets_win.py` 从目标 exe 读取 16 字节，不手写）；
+3. **ABI 有调用点证据**（非靠函数体猜测），且结构偏移与数据表常量**已在当前游戏版本的 Windows 侧独立确证**（不照抄 Linux，不沿用旧版假设）；
+4. **实机验证**：`stl launch` 后 `logs\satfix.log` 出现 `hooked <key> @ <addr>`，且目标函数确实被游戏调用（`首次调用: <name>`）；
+5. **判据有实机证据**：要么抓到真实 EVENT，要么用活体探针 / 专项测试 mod 证明检出与回写链畅通；
+6. **未复核的结构偏移或已重构子系统必须显式降级/加安全闸**（如 4.6.0 的 `kVarShadowSupported = false`、`kShipSizeWriteEnabled = false`），绝不盲写内存。
 
-**「装上钩子」不等于「功能可用」** —— 必须看到调用计数在涨。
+**「装上钩子」不等于「功能可用」** —— 必须看到调用计数增长且零误伤、零崩溃。
 
 ---
 
@@ -161,18 +163,17 @@ cd satfix-win
 
 .\build.ps1                # 影子模式（只记录，不改数值）—— 开发/测试用
 .\build.ps1 -Replace       # ★ 回写模式（检出溢出就改回饱和值）—— 发布用
-.\build.ps1 -TestOnly      # 只跑离线测试，不编 DLL
+.\build.ps1 -TestOnly      # 只跑 winhook 单元测试，不编 DLL
 ```
 
-`build.ps1` 跑 4 套测试（25 / 58 / 14 组 / 24 项）。**必须全过**。
+`build.ps1` 自动执行 `ml64` 汇编桩、`cl` 编译与 4 步自动化检查（`test_winhook`、`test_stl_fix_win` 含 14 组判定向量、`test_load_plugin`、`check_plugin_pkg.py`），**必须全过**。
 
 产物：
-- `build/satfix.dll`
-- `plugin/`（链接用的工作目录）
-- `dist/satfix/`（发布包内容）
+- `build/satfix.dll`（编译中间输出）
+- `plugin/`（`stl plugin install --link` 使用的开发目录，运行时产生 `config\`、`logs\`）
+- `dist/satfix/`（干净的发布包内容，供合规检查和打包脚本消费）
 
-**两种模式是编译期开关**（`-Replace`），不是配置项 —— 故意如此，免得手动注入时误改存档。
-二进制里带 marker，日志第一行会打印 `satfix-build-mode:write-back` 或 `:shadow`。
+**两种模式是编译期开关**（`-Replace`），不是配置项 —— 防止手动注入时误改存档。DLL 内置 `satfix-build-mode:write-back` / `:shadow` 标记，日志首行也会打印。
 
 ### 实机验证
 
@@ -183,21 +184,20 @@ $stl = "$env:LOCALAPPDATA\Programs\Stellaris Launcher\stl.exe"
 # 日志：<repo>\satfix-win\plugin\logs\satfix.log
 ```
 
-- **`--link` 指向开发目录**：`config\`、`logs\` 会写在里面，正常。
-- **改了 DLL 要先关游戏**，否则 `build.ps1` 复制失败（文件被占用）。
-- 配置**热重载**（每 2 秒看一次修改时间），改 `config\satfix.ini` 不必重启游戏。
-- `game_click.ps1` / `perf_probe.ps1` / `tick_probe.ps1` 是辅助脚本（截图、性能测量）。
+- **改了 DLL 要先关游戏**，否则 `build.ps1` 复制 `satfix.dll` 会因文件被占用而失败。
+- 配置**热重载**（每 2 秒检查 `config\satfix.ini` 的 mtime），改设置不必重启游戏。
+- `game_click.ps1` / `perf_probe.ps1` / `tick_probe.ps1` / `run_inject_test.ps1` 为实机测试辅助脚本。
 
 ### Linux（`satfix/`）
 
 ```bash
 cd satfix
-./build.sh              # 影子模式
+./build.sh              # 影子模式（含 gen_targets.py --check 与 ABI 回归）
 ./build.sh replace      # 回写模式
 ./test_stl_fix          # 离线对拍，必须先全过
 ```
 
-**注意**：本机没有 Linux 工具链，`satfix/` 目前只能静态审查，不能构建验证。
+**注意**：当前 Windows 本机无 Linux 工具链，`satfix/` 目前只能静态审查，不能本地构建验证。
 
 ---
 
@@ -207,140 +207,84 @@ cd satfix
 
 | 策略 | 含义 |
 | --- | --- |
-| `kExact` | 有精确饱和参考实现，可逐位比对、可回写 |
+| `kExact` | 有精确饱和参考实现或硬判据，可逐位比对、可回写 |
 | `kInputGuard` | 危险在输入域：先把输入夹到安全域再调原函数 |
 | `kObserve` | 只判定「是否进入危险域」，只记日志 |
+| `kDisabled` | 地址已确证但 ABI 未确认：安全拒绝安装 |
 
-当前分布：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**（合计 19）。
-**这个数以 `src/satfix_targets_win.generated.hpp` 为准** —— 它由 `gen_targets_win.py` 生成，
-手写的文档容易写错（本文件早期版本就写成过 7/1/10）。要核对：
+当前 Windows 分布：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**（合计 19；另注意 4.6.0 下 `ship_size_max_hp` 虽标 `kExact` 但受 `kShipSizeWriteEnabled = false` 保护暂不回写）。
+**策略统计一律以 `satfix-win/src/satfix_targets_win.generated.hpp` 为准**，核对命令：
 
 ```powershell
-Select-String -Path satfix-win\src\satfix_targets_win.generated.hpp -Pattern ', k(Exact|Observe|InputGuard),' |
+Select-String -Path satfix-win\src\satfix_targets_win.generated.hpp -Pattern ', k(Exact|Observe|InputGuard|Disabled),' |
     Group-Object { $_.Line -replace '.*,\s*(k\w+),.*','$1' } | Select-Object Name,Count
 ```
 
 ### 回写闸门（重要）
 
-**宁可漏报，不可误改。** 只在「游戏值本身呈 wrap 特征」时才回写：
+**宁可漏报，不可误改。** 只在游戏值本身呈明确 wrap 特征时才回写：
+- 负值（上限 / 伤害 / 船体基础值不可能为负）；
+- 或 `0` 而重算为正 / 加算项塌 0 且倍率 ≥ 1e7（护盾 / 装甲塌 0 现场）。
 
-- 负值（上限/伤害不可能为负）
-- 或 `0` 而重算为正（护盾/装甲「加算被塌成 0」的现场）
-
-正常值哪怕重算不等，也只记 NOTE 不改。理由：重算可能漏了条件性修正，
-而漏项只会让重算**偏小** —— 偏小的一侧不会把正常值判成溢出，方向是安全的。
+正常正值哪怕重算不等，也绝不改写。漏掉条件性加法修正只会让重算偏小，方向上是安全的。
 
 ### 性能纪律
 
-热路径函数被调用**百万到千万次**（`CalcMax*` 各约 810 万次/局，`ApplyModifierMult` 463 万次）。
-所以：
+热路径函数每局被调用**数百万至数千万次**（`Atan2` 5000 万+、`ApplyModifierMult` 3000 万+、`CalcMax*` 各数百万次）。必须遵守：
 
-- **能早退就早退**。例：所有回写分支都要求 `v <= 0`，那 `v > 0` 就直接 `return`，
-  不必做 4~6 次游戏函数调用 + 扫 46 项修正表。
-- **热路径别用 `safe_read`**。它每次都调 `VirtualQuery`（内核调用）。
-  地址来自游戏传入指针的场合用 `whk::fast_read`（只 SEH 兜底）。
-  来自我们解析的 RVA / 猜测偏移的，**仍然必须** `safe_read`。
-- **诊断开关默认关**。任何逐调用的额外开销（原子加、格式化）都要能关掉。
-- 已实测：一次「每调用都记日志」的诊断刷了 19899 行，把日志上限打满。
+- **能早退就早退**：如 `detour_max_hp` 所有回写分支都要求 `v <= 0`，正常 `v > 0` 直接返回；
+- **热路径用 `whk::fast_read`，不用 `safe_read`**：`safe_read` 每次调 `VirtualQuery`（内核切换）。仅当指针来自游戏自身传入的可信对象时用 `fast_read`（SEH 兜底）；解析出的 RVA、动态全局指针、vtable 探测或猜测偏移**必须继续使用 `safe_read`**；
+- **诊断开关默认关闭**：任何逐调用开销（直方图计数、诊断日志、绕过早退路径）都必须默认关闭并可配置开关。
 
 ### 日志
 
-上限 20000 行。事件类日志要**限流**（例如「按 design 指针只报一次」），
-因为舰船详情面板会**每帧**重算。
+Windows 日志上限 `SATFIX_MAX_LOGS = 20000` 行，使用 `SRWLOCK` + 单次整行缓冲 `fputs` 防多线程断行；事件类日志必须限流（如按 `design` 指针去重），避免详情面板每帧重算刷满日志。
 
 ---
 
-## 6. 文档
+## 6. 文档与权威来源
 
 | 文件 | 作用 |
 | --- | --- |
-| `satfix-win/README.md` | Windows 侧完整记录：目标清单、定位证据、踩坑 |
-| `satfix/README.md` | Linux 侧记录 |
-| `satfix-win/RELEASE_NOTES.md` | **发布说明的唯一来源**，被 `tools/package_release.ps1` 用正则解析 |
-| `satfix-win/tools/gen_targets_win.py` | **目标的权威来源** —— 每个目标的 `evidence` 字段写在这里 |
-
-**`RELEASE_NOTES.md` 不要随意改格式** —— 打包脚本靠 `## v<version>` 段落提取说明。
-**`gen_targets_win.py` 的 `CONFIRMED` 表是唯一权威**，README 里的数字可能与它不同步，
-有疑问**以 `gen_targets_win.py` 和生成的 `src/satfix_targets_win.generated.hpp` 为准**。
+| `satfix-win/tools/gen_targets_win.py` | **Windows 目标、RVA（含 `RVA_46` 覆盖表）与证据的唯一权威来源** |
+| `satfix-win/src/satfix_targets_win.generated.hpp` | 由 `gen_targets_win.py` 生成的头文件 —— **禁止手改** |
+| `satfix-win/plugin/stl-plugin.json` | **版本号 `version` 与适配时间戳清单的唯一来源**（`build.ps1` 和 `package_release.ps1` 均从此读版本） |
+| `satfix-win/RELEASE_NOTES.md` | **GitHub Release 发布说明的唯一来源**，被 `package_release.ps1` 按 `## v<version>` 正则解析 —— **严禁破坏标题格式** |
+| `README.md` | 仓库总览（玩家 + 开发者入口） |
+| `satfix-win/README.md` | Windows 插件当前架构、目标、配置与运行手册 |
+| `satfix-win/docs/ENGINEERING_NOTES.md` | Windows 逆向方法论、ABI/LTCG 踩坑录与版本演进档案 |
+| `satfix-win/tools/relocate/README.md` | 游戏更新后重定位工具链操作手册 |
+| `satfix/README.md` | Linux 侧文档 |
 
 ---
 
 ## 7. 必须遵守插件手册
 
-Windows 侧不是普通 DLL，是 **Stellaris Launcher 插件**，必须满足规范：
-
-> `stellaris-launcher/docs/PLUGIN_HANDBOOK.zh-CN.md`
-> （英文版 `PLUGIN_HANDBOOK.md`；本仓库上级目录的 `stellaris-launcher/` 里）
-
-**改 Windows 侧代码前，先读手册 §6（编写 DLL 的规则）与 §13（发布前检查清单）。**
+Windows 侧是 **Stellaris Launcher 插件**，改代码前必须核对手册 §6（编写 DLL 的规则）与 §13（发布前检查清单）：
+> `../stellaris-launcher/docs/PLUGIN_HANDBOOK.zh-CN.md`
 
 ### 硬性要求（§6，违反会导致崩溃/卡死/被拒）
 
 | 条款 | 要求 | 本插件现状 |
 | --- | --- | --- |
-| 6.1 | `DllMain` 只创建线程；不等待、不 `LoadLibrary`、不碰引擎、不做文件/网络 | ✅ 只 `CreateThread` + `CloseHandle` |
+| 6.1 | `DllMain` 只创建线程；不等待、不 `LoadLibrary`、不碰引擎、不做文件/网络 | ✅ 只 `DisableThreadLibraryCalls` + `CreateThread` + `CloseHandle` |
 | 6.2 | 从**自己模块地址**取插件路径；不用 CWD、不写死 `Documents\…` | ✅ `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` |
-| 6.3 | 引擎函数只在游戏主线程调用 | ✅ detour 内只做原子写，重活推迟到主线程泵 |
-| 6.4 | 原始内存读用 SEH 包住 | ✅ `whk::safe_read` / `fast_read` |
+| 6.3 | 引擎函数只在游戏主线程调用；自有线程只做等待与文件 mtime 检查 | ✅ detour 做轻量工作，重活推迟到主线程泵 |
+| 6.4 | 原始内存读用 SEH 包住；**严禁照抄 Linux 结构偏移** | ✅ `whk::safe_read` / `fast_read`；偏移必在 Windows 侧独立实证 |
 | 6.5 | detour 必须调原函数；不假设自己是唯一钩子；不恢复他人钩子 | ✅ `TypedHook::call()` |
 | 6.6 | **不卸载自己**（不 `FreeLibraryAndExitThread`） | ✅ 源码中无调用 |
-| 6.7 | 静态运行库 `/MT`；不弹控制台；只支持 x64 | ✅ `/MT`、无 `AllocConsole` |
+| 6.7 | 静态运行库 `/MT`；不弹控制台；只支持 x64 | ✅ `/MT`、无 `AllocConsole`、仅依赖 `KERNEL32.dll` |
 
-**6.4 还有一条容易忽略的**：手册明确说「不要依赖 Linux 版反编译里的结构偏移，
-Windows（MSVC）与 Linux（GCC）的对象布局不同」。本项目的做法是**偏移一律在 Windows
-侧重新确证**（读函数体），Linux 侧只用来**指路**，不用来抄数值。
+**6.4 血泪教训**：`CShipSize::max_hitpoints` 在 Linux 为 `ship_size + 0x678`，在 Windows 为 `self + 0x6b8`（子对象基址 `+0x40` 错位）。即使 `ReadMember` 里三个 token 到偏移的映射看起来与 Linux 逐字相同，**因为 `this` 指针基址不同，照抄 `0x678` 会去改一个 bool**。证明一个偏移必须使用**独立于 Linux** 的判据（如 HULLMAP 探针：拿已确证的同义值在同对象内存内反扫匹配槽位），并且大版本更新后必须复核（复核前用安全闸暂停写回）。
 
-**⚠️ 2026-10-12 又踩了一次，而且是「核对过也没用」的那种**：`CShipSize::max_hitpoints`，
-Linux 是 `ship_size + 0x678`，Windows 真值是 `self + 0x6b8`（子对象基址 +0x40 的错位）。
-当时的核对方式是「Linux 与 Windows 的 token→偏移映射逐字相同」，**三个 token 全对上了** ——
-但**核对的两个量本身就在不同的基址上**，所以「逐字对上」≠「同一个地址」。
-**照抄会去改一个 bool**（0x678 上只有 0/1）。
+**6.3 线程安全教训**：引擎工作线程（如 `CPdxTaskScheduler`）可能并发进入被 hook 函数，绝不可在 detour 里调用非线程安全的本地化/UI API（早年调 `CShipSize::GetName()` 导致 SEGV）。
 
-**这类错误的通用判据**：证明一个偏移，必须有一个**不依赖 Linux** 的判据。这次用的方法是
-「拿一个已确证的同义值当标尺，在对象里扫值相等的槽位」——
-`ship_size_of(design)` 拿到对象，`*(design+0x10)`（已确证的面板基础值）当标尺，
-全范围扫「值 == 标尺」的偏移，只命中 `0x6b8`。
-凡是「两个平台的偏移看起来一样」的场合，都要警惕它其实是**基址不同造成的巧合**。
+### 清单与校验（§4 / §7 / §10 / §13）
 
-### 6.3 线程模型（最容易让游戏静默崩溃）
-
-引擎代码**只能**在游戏主线程跑。本插件的模式：
-
-- detour 里**只做原子写**（计数、置标志）
-- 真正的活（读设置、写日志、解析）推迟到「主线程泵」—— 只在游戏自己进入被 hook 函数时触发
-
-**不要**在自己的线程里调游戏函数。这条踩过坑：早期在 hook 里调
-`CShipSize::GetName()`，因为它在 `CPdxTaskScheduler` 工作线程上被调用、
-而本地化字符串池不是线程安全的 → **SEGV**。
-
-### 清单（§4 / 附录 B）
-
-`plugin/stl-plugin.json` 必须满足：
-
-- `"schema": 2`
-- `id` 合法且**与以前一致**（改 id 等于换一个插件，用户设置会丢）
-- `version` 与 tag、发布说明标题一致
-- `game.exe_timestamps` 列出所有测试过的构建（**注意它是嵌在 `game` 下的**，不是顶层）
-- `config[].default` 指向的文件必须真的在包里
-- 自动更新需要 `update.github` + `update.asset`
-
-DLL 自己也要**再校验一次** PE 时间戳与序言签名（手册 §7），不匹配就跳过该目标并写日志 ——
-这样在未列出的构建上（手动注入时）是**安全地不工作**，而不是乱读写内存。
-
-### 包与发布（§10 / §13）
-
-- zip 的内容**就是插件文件夹**；**不含** `config\`、`logs\`
-- 标签 = `v` + `version`；附件名匹配 `update.asset`；附带 `.sha256`
-- 正式发布（不是草稿、不是预发布）
-
-**自检命令**：
-
-```powershell
-python satfix-win\tools\check_plugin_pkg.py     # 校验 dist\ 是否符合手册
-```
-
-> 注意：对 `plugin\`（开发链接目录）跑这个会报 `config\`/`logs\` 存在 —— 那是正常的，
-> 该检查针对的是 `dist\` 发布目录。
+- `plugin/stl-plugin.json` 必须包含 `"schema": 2`、保持 `id: "satfix"` 不变、`game.exe_timestamps`（嵌在 `game` 下）、有效的 `config[].default`、以及自动更新字段 `update.github` / `update.asset`。
+- DLL 自身必须再做一次 PE 时间戳 + 16 字节序言签名校验。
+- 发布包 zip 内容即插件目录，**严禁包含** `config\`、`logs\` 或构建中间文件。
+- 自检命令：`python satfix-win\tools\check_plugin_pkg.py satfix-win\dist\satfix [--exe <path>]`。
 
 ---
 
@@ -349,65 +293,52 @@ python satfix-win\tools\check_plugin_pkg.py     # 校验 dist\ 是否符合手�
 ```powershell
 cd satfix-win
 .\build.ps1 -Replace                    # 必须是回写模式
-.\tools\package_release.ps1             # 校验 + 打包（版本号取自 stl-plugin.json）
+.\tools\package_release.ps1             # 校验 + 打包（版本号取自 plugin\stl-plugin.json）
 ```
 
-`package_release.ps1` 的参数只有三个：`-OutDir`（默认 `release/`）、
-`-Mode`（`write-back` / `shadow` / `any`，**默认 `write-back`**）、`-Exe`。
-**版本号不通过参数传** —— 它从 `plugin/stl-plugin.json` 的 `version` 字段读。
+`package_release.ps1` 参数：`-OutDir`（默认 `release/`）、`-Mode`（`write-back` / `shadow` / `any`，**默认 `write-back`**）、`-Exe`。版本号自动从 `plugin/stl-plugin.json` 读取，不通过参数传。
 
-打包脚本会检查：
-- 包内**不含** `config\` / `logs\`（用户私有）
-- 清单声明的 `config.default` 文件确实在包里
-- **构建模式是 `write-back`**（影子模式默认被拒；要放行得显式 `-Mode any`）
-- 从 `RELEASE_NOTES.md` 提取 `## v<version>` 段落生成 `<zip>.notes.md`
-
-**tag 要自己打**（脚本不校验，只打印出建议的 `gh release create` 命令）：
+打包脚本会校验：构建模式、无 `config\`/`logs\`、默认配置存在、`RELEASE_NOTES.md` 含 `## v<version>` 段落，并生成 `.zip`、`.sha256` 与 `.zip.notes.md`。随后手工打 tag 并创建正式 Release（非草稿/预发布）：
 
 ```powershell
-git tag v0.2.0 && git push origin v0.2.0
-gh release create v0.2.0 satfix-v0.2.0.zip satfix-v0.2.0.zip.sha256 `
-    --title "satfix v0.2.0" --notes-file satfix-v0.2.0.zip.notes.md
+git tag v<version> && git push origin v<version>
+gh release create v<version> satfix-v<version>.zip satfix-v<version>.zip.sha256 `
+    --title "satfix v<version>" --notes-file satfix-v<version>.zip.notes.md
 ```
 
-**版本号只在 `plugin/stl-plugin.json` 的 `version` 一处定义** —— 打包、tag、发布说明的
-`## v<version>` 标题都要与它一致。
-
-发布包：`github.com/Aa728848/satfix`，asset `satfix-*.zip`。
+发布仓库：`github.com/Aa728848/satfix`，asset 匹配 `satfix-*.zip`。
 
 ---
 
 ## 9. 反模式（出现即为错误）
 
-1. **不看 Linux 源码就硬猜 Windows 函数** —— 这是本项目最贵的错误来源。
-2. **靠映射表的名字当身份证明**。`win_linux_mapping_final_452.json` 的
-   `confidence: "exact"` 只表示「字符串指纹唯一命中」，**不代表函数就是同名的那个**。
-   实测反例：映射说 `FUN_1408b3700 = ApplyModifierMult`，实际是 modifier token 分发器。
-3. **靠函数体猜 ABI**。必须看调用点。
-4. **「钩子装上了」就宣布完成**。要看调用计数在涨、判据有实机证据。
-5. **改回写路径却不留退路**。任何回写都要有明确的「何时不回写」闸门。
-6. **在热路径里加重活**（`VirtualQuery`、字符串格式化、每调用一次日志）。
-7. **只改一个平台**。两边的逻辑要同步；Windows 侧的常量/偏移**不要照抄** Linux 的，要重新确证。
-8. **手改 `src/satfix_targets_win.generated.hpp`** —— 它是生成的。改 `tools/gen_targets_win.py`。
+1. **不看对应版本的 Linux 源码就硬猜 Windows 函数** —— 最昂贵的错误来源。
+2. **拿旧版本（如 4.5.3）的 ModifierType 枚举号或结构偏移直接套在新版（如 4.6.0）上**。
+3. **靠映射表的名字当身份证明**（`win_linux_mapping_final_452.json` 的 `exact` 仅指字符串指纹唯一命中）。
+4. **靠函数体猜 ABI** —— 必须看调用点核对参数个数、顺序与 sret。
+5. **在 Windows 侧直接把 C detour 当钩子装上去而不走 `detour_stubs.asm`** —— 会踩中 LTCG 破坏集导致偶发 CTD。
+6. **「钩子装上了」就宣布完成** —— 必须看到调用计数增长、判据或探针通过。
+7. **改回写路径不设保守闸门 / 未复核偏移就开放写回**。
+8. **在热路径加重活**（`VirtualQuery`、逐调用日志或格式化）。
+9. **手改 `src/satfix_targets_win.generated.hpp`** —— 必须改 `tools/gen_targets_win.py` 后重新生成。
 
 ---
 
-## 10. 快速上手
+## 10. 快速命令备忘
 
 ```powershell
-# 1) 看当前目标清单与策略
-#    没有 --list 这种开关；直接读生成的头文件，或看 gen_targets_win.py 的 CONFIRMED 表
+# 1) 查看当前 Windows 目标清单与策略分布
 Select-String -Path satfix-win\src\satfix_targets_win.generated.hpp -Pattern '^    \{"'
 
-# 2) 校验 RVA/签名是否仍与目标 exe 匹配（游戏更新后先跑这个）
+# 2) 游戏更新后先校验 RVA/时间戳/签名是否漂移
 python satfix-win\tools\gen_targets_win.py --check
 
-# 3) 构建 + 测试
+# 3) 重新生成目标头文件
+python satfix-win\tools\gen_targets_win.py
+
+# 4) 构建 + 全套离线测试 + 组装发布目录与合规校验
 cd satfix-win; .\build.ps1 -Replace
+
+# 5) 独立检查发布包是否合规
+python satfix-win\tools\check_plugin_pkg.py satfix-win\dist\satfix
 ```
-
-`gen_targets_win.py` 只有三个开关：`--exe`（目标 exe 路径）、`--out`（输出头文件）、
-`--check`（只校验不写）。**不带参数就是重新生成**。
-
-遇到「游戏更新后钩子全失效」：跑 `--check`，它比对 PE 时间戳与每个目标的序言签名，
-不匹配会明确指出是哪个目标漂了。

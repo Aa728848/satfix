@@ -1,209 +1,205 @@
-# satfix —— 数值溢出修复
+# satfix —— Stellaris 定点算术溢出守卫
 
-群星后期装了 mod 之后，数值容易被堆到游戏算不动的地步，然后悄悄变成负数或者 0：
-海军容量变负、资源扣成天文数字、外交权重突然为负、护盾上限直接归零。
-这个插件在这些地方兜住，让数值停在上限，而不是翻过去变成乱的。
+后期装了高倍率 mod 之后，群星（Stellaris）内部的定点数值容易越过 64 位整数上限，然后**不报错、不崩溃，悄悄翻成负数或塌成 0**：
 
-两个平台各有一份实现，做法一样：
+- 护盾 / 装甲 / 船体上限塌成 `0` 或显示成负数；
+- 舰船详情面板里的「伤害」变成天文数字的负数；
+- 舰船设计界面的基础「船体值」变成负数；
+- 海军容量、资源扣减、外交权重、脚本变量或修正倍率在极端堆叠下发生回绕（wrap）。
 
-| 目录 | 平台 | 注入方式 |
-|---|---|---|
-| [`satfix/`](satfix/) | Linux | `LD_PRELOAD` 预加载 `.so`，按 mangled 名 `dlsym` 定位 |
-| [`satfix-win/`](satfix-win/) | Windows | Stellaris Launcher 的 DLL 插件，按 RVA + 序言签名定位 |
+`satfix` 在关键算术与结算关口注入饱和处理，让越界数值停在格式天花板（约 **92 万亿游戏单位**，`INT64_MAX / 1e5`），而不是回绕成损坏数值。
 
-## 溢出是怎么发生的
+---
 
-Stellaris 的定点数用 `int64` 存，1.0 记作 `100000`，上限约 `9.22e18 / 1e5 ≈ 9.2e13` 游戏单位。原版离这个上限极远，mod 堆叠乘法就很容易越过去。越过去之后游戏既不报错也不崩溃，直接翻成负数：海军容量变成负的、资源扣成天文数字、外交权重突然为负。
+## 平台实现与当前状态
 
-这类 bug 难查，原因就在这里：它不崩、不报错，只是数值不对。
+仓库包含两个平台实现与一套底层 hook 库：
 
-## 现状
+| 目录 | 平台 | 形态与定位方式 | 当前适配版本 | 状态 |
+| --- | --- | --- | --- | --- |
+| [`satfix-win/`](satfix-win/) | **Windows (x64)** | [Stellaris Launcher](https://github.com/Yidhar/stellaris-launcher) 合规 DLL 插件；硬编码 RVA + 16 字节序言签名校验 | **Cygnus v4.6.0**（`0x6AF6BDEC`，插件 `v0.5.0`） | 主力维护、实机验证 |
+| [`satfix/`](satfix/) | **Linux (x86-64)** | `LD_PRELOAD` 共享库（`sat_guard.so`）；按 mangled 符号名 `dlsym` / ELF 符号表定位 | Cygnus v4.5.2（`32709cf254...`） | 基础实现，滞后于 Windows 侧 |
+| [`hooklib/`](hooklib/) | **Linux (x86-64)** | 零依赖单头文件内联 hook 库 `shk.hpp` | 通用 ELF x86-64 | Linux 侧底层依赖 |
 
-Windows 侧 17 个目标全部实机验证通过（Linux 侧的 19 个 hook 目标在 Windows 上都有覆盖）：
+### 覆盖策略一览
 
-| | EXACT（能真正修数值） | INPUT_GUARD | OBSERVE |
-|---|---|---|---|
-| Linux | 6 | 2 | 11 |
-| Windows | 6 | 1 | 10 |
+所有 hook 目标按干预方式分为三类：
 
-EXACT 集合两个平台完全相同：`cfx_get_rounded`、`cfx_to_fp15`、两个 `ApplyModifierMult`、`var_add`、`var_multiply`。
+- **EXACT**：拥有饱和参考实现或硬判据，可逐位比对并在回写模式下纠正数值；
+- **INPUT_GUARD**：溢出发生在输入域，先将输入夹取到安全域再调用原函数；
+- **OBSERVE**：仅检测是否进入危险域并记录日志，不改数值。
 
-`cfx_get_rounded64` 因 MSVC 的 COMDAT 折叠与 `cfx_get_rounded` 同地址，一个钩子覆盖两者。`cfx_safe_sqrt_int` 在 Windows 侧没有对应代码（MSVC 不生成该重载里那步换算），详见 `satfix-win/README.md` §0.1.11。
+| 平台 | 已装目标 | EXACT | INPUT_GUARD | OBSERVE | 备注 |
+| --- | :---: | :---: | :---: | :---: | --- |
+| **Windows (`v0.5.0`)** | **19**（+6 辅助函数） | 9\* | 1 | 9 | `cfx_get_rounded64` 因 MSVC COMDAT 折叠与 `cfx_get_rounded` 共用同一钩子；`cfx_safe_sqrt_int` 经证实 Windows 侧不生成该重载 |
+| **Linux (`v4.5.2`)** | **19**（+6 辅助函数 + ImGui 调试窗） | 8 | 2 | 9 | 尚未同步 Windows 侧新增的 `damage_per_day`、`ship_size_max_hp`、船级表重算及 4.6.0 适配 |
 
-一局后期 mod 存档的实测：2390 万次调用，0 条真实分歧，游戏全程稳定。
+> \* **4.6.0 主动安全闸**：Windows `v0.5.0` 中有两处为防止版本升级误改而主动收紧的设计：
+> 1. `ship_size_max_hp`（策略标为 `kExact`）依赖的 `CShipSize + 0x6b8` 偏移在 4.6.0 上尚未完成活体复核，当前版本暂仅记录 EVENT、暂停回写；
+> 2. 4.6.0 将脚本变量底层改为 token 键控哈希表，`var_multiply` / `var_add` 的旧四步读回链已停用，当前仅计数。
+
+详细目标清单与地址见 [`satfix-win/README.md`](satfix-win/README.md) 与 [`satfix/README.md`](satfix/README.md)。
+
+---
+
+## 溢出为什么会发生
+
+Stellaris 内部使用三种 64 位定点方言，其中最常见的是十进制 `CFixedPoint`（`int64_t`，`1.0 = 100000`）：
+
+- 表示上限为 `INT64_MAX / 100000 ≈ 9.22 × 10^13` 游戏单位（约 92.2 万亿）。
+- 原版游戏数值离这个天花板差十几个数量级，但后期高倍率 mod 叠加修正后，乘法、累加或四舍五入（如 `GetRounded` 中的 `x + 50000`）会直接越界回绕成负数。
+- 部分读取原语（如 `CShipSize::GetModifierValue`）还会把负值夹成 `0`，导致「护盾加成溢出 → 负值 → 被夹成 0 → 护盾上限塌成 0」。
+- 由于 `CFixedPoint` 的基础四则运算符几乎全部内联（反编译中 `/ 100000` 展开达数千处），无法全局替换，因此本项目的策略是在**修正出口、结算函数与非内联算术成员**这些关键关口做饱和守卫。
+
+---
 
 ## 快速开始
 
-### Windows
+### Windows 玩家：直接安装发布版
+
+> 仓库内不提交预编译的 `satfix.dll`。普通玩家请直接下载发布包。
+
+1. 从 [GitHub Releases](https://github.com/Aa728848/satfix/releases) 下载最新 `satfix-v*.zip`（可选用同名 `.sha256` 校验完整性）。
+2. 通过 [Stellaris Launcher](https://github.com/Yidhar/stellaris-launcher) 安装并启用，或将 zip 内容解压到：
+   ```
+   Documents\Paradox Interactive\Stellaris\plugins\satfix\
+   ```
+3. 通过启动器启动游戏。运行时日志位于插件目录的 `logs\satfix.log`，配置文件位于 `config\satfix.ini`（修改后每 2 秒自动热重载，无需重启游戏）。
+
+清单已配置 `update.github` 与 `update.asset`，支持通过启动器自动检查更新。
+
+### Windows 开发者：从源码构建
+
+需要 **Visual Studio 2022 Build Tools**（x64 C++ 工具链含 `cl.exe` / `ml64.exe` + Windows SDK）与 **Python 3**（可选 `pefile` 用于校验 exe 时间戳）。
 
 ```powershell
 cd satfix-win
-.\build.ps1                     # 影子模式：编译 + 跑 4 套自测（25/25 + 58/58 + 14组 + 24/24）
-.\build.ps1 -Replace            # 回写模式：发布用这个（会改数值，见下）
+
+.\build.ps1                # 影子模式：只记录日志、不改数值（开发自测用）
+.\build.ps1 -Replace       # 回写模式：检出溢出即改回饱和值（发布版用）
+.\build.ps1 -TestOnly      # 仅编译并运行 winhook 单元测试
 ```
 
-打发布包（按[插件手册](https://github.com/Yidhar/stellaris-launcher/blob/main/docs/PLUGIN_HANDBOOK.zh-CN.md)
-§10 产出 zip + `.sha256`）：
+`build.ps1` 会依次完成汇编寄存器保全桩（`detour_stubs.asm`）、编译 DLL、运行 3 套原生离线自测 + 组装 `dist\satfix\` + 运行插件包合规检查，任意一项失败都会中止。
+
+使用 Stellaris Launcher 进行本地开发联调：
 
 ```powershell
-.\tools\package_release.ps1
-```
-
-然后用 [Stellaris Launcher](https://github.com/Yidhar/stellaris-launcher) 安装：
-
-```powershell
-stl plugin install .\plugin --link     # 开发：链接，重编译即生效
+stl plugin install .\plugin --link     # 链接开发目录，重编译后立即生效
 stl plugin enable satfix
 stl launch
 ```
 
-日志在 `plugin\logs\satfix.log`。也可以直接从
-[Releases](https://github.com/Aa728848/satfix/releases) 下载 zip 解压到
-`Documents\Paradox Interactive\Stellaris\plugins\satfix\`，或让启动器自动更新。
-
-### Linux
+### Linux 构建与运行
 
 ```bash
 cd satfix
-./build.sh
-LD_PRELOAD=$PWD/sat_guard.so ./stellaris
+./tools/configure.sh                   # 自动探测 Steam 目录，或传入 /path/to/Stellaris
+./build.sh                             # 影子模式（含地址漂移检查与 ABI 回归）
+./build.sh replace                     # 回写模式
+./test_stl_fix                         # 运行离线算术对拍，要求 failures=0
+
+# 启动游戏
+LD_PRELOAD="$PWD/sat_guard.so" /path/to/Stellaris/stellaris
+# 或在 Steam 启动选项中设置：
+#   LD_PRELOAD=/abs/path/to/satfix/sat_guard.so %command%
 ```
 
-## 两种模式
+---
 
-发布给用户的是回写模式。影子模式只用于开发自测，不随发布包分发。
+## 两种构建模式：回写 vs 影子
 
-| 模式 | 编译 | 行为 | 用途 |
-|---|---|---|---|
-| 回写 | `-Replace` | 检出溢出时把值改写成饱和值 | 发布给用户的版本 |
-| 影子 | 默认 | 只检出并记录，不改数值 | 开发自测 |
+为了防止开发调试或手动注入时误改存档，**是否写回数值是编译期开关**，不暴露为运行时配置项：
 
-这是编译期开关（Linux 侧 `SATFIX_REPLACE=1`），故意不做成配置项，免得手动注入时误改存档。
+| 模式 | Windows 构建 | Linux 构建 | 二进制标记 | 行为与用途 |
+| --- | --- | --- | --- | --- |
+| **回写模式** | `.\build.ps1 -Replace` | `./build.sh replace` | `satfix-build-mode:write-back` | 检出溢出时将数值改写回饱和值；**正式发布版本** |
+| **影子模式** | `.\build.ps1` | `./build.sh` | `satfix-build-mode:shadow` | 仅检出并记日志，绝不改写数值；**开发/观察用** |
 
-确认手上那个 DLL 是哪种模式，不用靠记性：每种构建都会往二进制里打一个 marker，字节搜索即可，两种 DLL 大小几乎相同。
+确认任意 `satfix.dll` 的构建模式无需依赖记忆：可直接搜索二进制内的 `satfix-build-mode:` 字符串，或查看 `logs\satfix.log` 第一行（例如 `satfix-win 0.5.0  REPLACE=1  satfix-build-mode:write-back`）。
 
-```
-satfix-build-mode:write-back     回写
-satfix-build-mode:shadow         影子
-```
+---
 
-日志首行也会写出来：`satfix-win 0.2.0  REPLACE=1  satfix-build-mode:write-back`。
-`tools/package_release.ps1` 默认要求 write-back，打错模式会直接拒绝打包。
-
-回写路径有端到端验证，同一构建脚本只差一个开关：
-
-| 构建 | `GetRounded(INT64_MAX)` 返回 | 含义 |
-|---|---|---|
-| shadow | `-92233720368547` | 游戏 wrap 后的值（就是那个 bug） |
-| **write-back** | `+92233720368547` | **饱和值（被纠正了）** |
-
-## Windows 侧怎么定位目标
-
-`stellaris.exe` 没有 PDB、只导出 110 个符号、没有任何 C++ 符号，所以不能像 Linux
-那样按 mangled 名解析。`satfix-win/` 用的办法是 RVA + 16 字节序言签名双重校验，
-签名不匹配就停用该目标并写日志，不盲目读写内存。
-
-17 个目标靠四类判据找出来，都记录在 `satfix-win/tools/gen_targets_win.py` 的
-`CONFIRMED` 表里，每条带证据：
-
-1. **独占字符串**，例如 `multiply_variable: variable %s is not set…` 唯一命中一个函数；
-2. **类型表索引常量集**，例如 `armor_max` 的 `0x15fec/0x15ff8/0x160a8` 三常量同现，扫过 110843 个函数块命中数为 1；
-3. **已确证函数的 helper 调用组合**，先提取 helper RVA，再找同类调用者；
-4. **NDefines 名字 thunk**，从 exe 的 `.rdata` 取出 `NDefines::<组>::<名字>` 字符串，反汇编引用它的 thunk，`r9` 里就是该 define 的全局地址。名字到全局地址的对应直接读出来了，再用谁读这个全局去定位函数。
-
-同时也记了几条被证伪的思路，免得后来人重走一遍：Linux 里的立即数指纹对 MSVC
-不可移植（GCC 用立即数的地方 MSVC 常用指令），成员偏移不能直接搬（`+0xb8→+0xc0`、
-`+0x808→+0x8b0`），按函数间距找邻居也不可靠。
-
-## 目录结构
-
-```
-satfix/                      Linux 侧（LD_PRELOAD）
-  sat_guard.cpp              插件本体
-  satfix_targets.generated.hpp  目标地址表（由 tools/gen_targets.py 生成）
-  stl_fix.hpp, debug_ui.hpp
-  tools/                     目标表生成 / 二进制查找 / 构建辅助
-  test/                      ABI 对拍（mock_stellaris + abi_check）
-  docs/
-  third_party/EirinMath-1.5.2/  MIT，见其自带 LICENSE
-
-satfix-win/                  Windows 侧（Launcher DLL 插件）
-  src/sat_guard_win.cpp      插件本体
-  src/satfix_targets_win.generated.hpp  目标地址表（由 tools/gen_targets_win.py 生成）
-  winhook.hpp                hook 引擎（5 字节 E9 rel32 + 蹦床 + 线程挂起式补丁）
-  satfix128.hpp              128 位中间量（MSVC 无 __int128）
-  stl_fix_win.hpp            定点算术与饱和参考实现
-  satfix_decision.hpp        判定逻辑 + 14 组进程内自检向量
-  tools/                     目标表生成 / dump 索引 / 指纹 / 调用者定位
-  test/                      3 套自测（hook 引擎、离线对拍、插件管线）
-  build.ps1                  一条命令：编译 + 4 套自测 + 打包
-  EVIDENCE_live_gameplay.txt 实机证据（含每一轮的方法与被证伪的思路）
-```
-
-## 发布与自动更新
-
-清单里已声明自动更新所需的字段：
-
-```json
-"update":   { "github": "Aa728848/satfix", "asset": "satfix-*.zip" },
-"homepage": "https://github.com/Aa728848/satfix"
-```
-
-所以启动器插件页会对它检查更新。发布流程（手册 §10.2）：
+## 发布与自动更新（Windows）
 
 ```powershell
-.\satfix-win\tools\package_release.ps1
-#   产出 release\satfix-v<版本>.zip + .sha256 + .zip.notes.md
-gh release create v<版本> <zip> <zip>.sha256 --notes-file <zip>.notes.md
+cd satfix-win
+.\build.ps1 -Replace
+.\tools\package_release.ps1
+# 产物：release\satfix-v<version>.zip、.sha256、.zip.notes.md
 ```
 
-标签必须等于 `v` + 清单里的 `version`，附件名要匹配 `update.asset`。
+打包脚本从 `plugin\stl-plugin.json` 读取 `version`，并在出包前强制校验四件事：
+1. DLL 必须包含 `satfix-build-mode:write-back` 标记（默认拒绝打包影子版）；
+2. 发布目录不含 `config\`、`logs\`；
+3. 清单声明的 `config[].default` 文件存在于包内；
+4. [`satfix-win/RELEASE_NOTES.md`](satfix-win/RELEASE_NOTES.md) 中存在对应的 `## v<version>` 段落（该文件是发布说明的唯一来源，脚本会自动抽出生成 `.notes.md`）。
 
-打包脚本会当场查四件事，任一不过就拒绝出包：
+打标签并发布（标签必须为 `v` + 清单 `version`）：
 
-1. 标签 = `v` + `version`；
-2. 包内没有 `config\`、`logs\`（手册 §10.1）；
-3. DLL 的构建模式，默认要求 `write-back`，打出影子版会被拒；
-4. `satfix-win/RELEASE_NOTES.md` 里有这个版本的那一节。
+```powershell
+git tag v<version> && git push origin v<version>
+gh release create v<version> release\satfix-v<version>.zip release\satfix-v<version>.zip.sha256 `
+    --title "satfix v<version>" --notes-file release\satfix-v<version>.zip.notes.md
+```
 
-发布说明的唯一来源是 [`satfix-win/RELEASE_NOTES.md`](satfix-win/RELEASE_NOTES.md)，
-脚本会抽出对应小节写成 `.notes.md`。不要在 GitHub 网页上直接改说明，下次发布会被覆盖，
-而且没有版本记录。
+---
 
-> 仓库里不含预编译的 DLL（`satfix.dll` 被 gitignore）。
-> 直接用请从 Releases 下载；自行编译需要 VS2022 BuildTools + Windows SDK。
+## 仓库结构
 
-## 合规性
+```text
+.
+├── AGENTS.md                           AI 与开发者的硬性工程约束
+├── README.md                           本文件（项目总览）
+├── hooklib/                            Linux x86-64 单头文件 hook 引擎（shk.hpp）
+├── satfix/                             Linux 侧实现（LD_PRELOAD）
+│   ├── sat_guard.cpp                   hook 入口与各目标 detour
+│   ├── stl_fix.hpp                     定点算术与饱和参考实现（基于 EirinMath）
+│   ├── satfix_targets.generated.hpp    自动生成的符号/地址表
+│   ├── debug_ui.hpp                    可选 ImGui 调试窗口（实验性）
+│   ├── tools/                          目录探测、目标表生成、依赖拉取脚本
+│   ├── test/                           离线算术对拍与 ABI 回归测试
+│   └── third_party/EirinMath-1.5.2/    上游定点库（MIT）
+└── satfix-win/                         Windows 侧实现（Stellaris Launcher DLL 插件）
+    ├── src/
+    │   ├── sat_guard_win.cpp           插件本体（DllMain、配置、日志、主线程泵、detour）
+    │   ├── detour_stubs.asm            LTCG 寄存器保全汇编转发桩（19 个钩子）
+    │   └── satfix_targets_win.generated.hpp  自动生成的 RVA + 16B 序言签名表
+    ├── winhook.hpp                     Windows x64 hook 引擎（5B E9 + 蹦床 + 线程挂起补丁）
+    ├── satfix128.hpp / stl_fix_win.hpp / satfix_decision.hpp  128 位饱和算术与判定自检
+    ├── plugin/                         开发联调目录（stl-plugin.json + defaults/satfix.ini）
+    ├── test/                           3 套原生离线测试（hook 引擎、算术对拍、宿主加载管线）
+    ├── tools/                          目标生成、包合规检查、打包、dump 索引与指纹工具
+    │   └── relocate/                   游戏版本更新后的跨版本地址重定位工具链
+    ├── docs/ENGINEERING_NOTES.md       逆向定位方法、ABI/LTCG 踩坑录与版本演进档案
+    ├── build.ps1                       一键构建、自测与组装发布目录
+    └── RELEASE_NOTES.md                GitHub Release 发布说明唯一来源
+```
 
-本插件按 [插件手册 v2](https://github.com/Yidhar/stellaris-launcher/blob/main/docs/PLUGIN_HANDBOOK.zh-CN.md)
-实现，逐条对照：
+---
 
-| 手册 | 要求 | 实现 |
-|---|---|---|
-| 6.1 | `DllMain` 只创建线程 | 只 `CreateThread`，不等待/不加载库/不碰引擎 |
-| 6.2 | 从模块路径找插件文件夹 | `GetModuleHandleExW` + `GetModuleFileNameW` |
-| 6.3 | 引擎代码只在游戏主线程 | detour 里只做原子写，重活丢给主线程泵 |
-| 6.4 | 原始内存读取有 SEH | `winhook::safe_read`；坏指针停用该目标并记日志 |
-| 6.5 | 钩子调原函数、不动他人钩子 | 蹦床转发；`uninstall` 只用于自测 |
-| 6.6 | 不卸载自己 | 不调用 `FreeLibraryAndExitThread` |
-| 6.7 | `/MT` 静态运行库、x64、不弹控制台 | `/MT`；x64；无 `AllocConsole` |
-| 7 | 两层版本检查 | 清单列 `exe_timestamps` + DLL 自己比对 PE 时间戳与序言签名 |
-| 8 | 读 `config\`、缺失用内置默认值、热重载 | 每 2 秒看修改时间 |
-| 9.1 | 日志写 `logs\`、运行中可读、有上限 | 见下方说明 |
-| 10.1 | 包内无 `config\`/`logs\` | `tools/check_plugin_pkg.py` 守着（23 项） |
+## 文档导航
 
-有一处有意偏离手册（9.1）。手册建议 `_wfsopen(..., _SH_DENYWR)`，实测本机
-`_wfopen_s` 与 `_SH_DENYWR` 都返回 `EACCES`，而 Win32 层
-`CreateFileW(GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE)` 能正常读。所以改用
-`_wsopen_s` + 显式 `_SH_DENYNO`，意图不变（允许游戏运行时读日志），手段按实测调整，
-并由 `test_load_plugin` 的可读性断言守住。
+| 文档 | 内容与受众 |
+| --- | --- |
+| [`satfix-win/README.md`](satfix-win/README.md) | Windows 插件完整说明：架构、19 个目标现状、修复机制、配置项、测试与发布 |
+| [`satfix-win/docs/ENGINEERING_NOTES.md`](satfix-win/docs/ENGINEERING_NOTES.md) | Windows 深度工程档案：跨平台定位法、6 次 ABI/偏移踩坑、LTCG 寄存器契约、版本迁移记录 |
+| [`satfix-win/tools/relocate/README.md`](satfix-win/tools/relocate/README.md) | 游戏更新后的地址重定位操作手册与脚本说明 |
+| [`satfix-win/RELEASE_NOTES.md`](satfix-win/RELEASE_NOTES.md) | 各版本更新日志（发布打包脚本唯一数据源） |
+| [`satfix/README.md`](satfix/README.md) | Linux 侧实现、定点溢出实测结论、目标清单与运行指南 |
+| [`hooklib/README.md`](hooklib/README.md) | `shk.hpp` 零依赖 Linux hook 库文档 |
+| [`AGENTS.md`](AGENTS.md) | 跨平台反编译对照、ABI 核对、LTCG 破坏集与插件合规等硬性开发约束 |
 
-## 限制
+---
 
-- 只对已确证 RVA 的版本生效。游戏更新后签名校验会挡下全部目标并写日志，需要重新确证地址（`tools/gen_targets_win.py --check` 能报告漂移）。
-- OBSERVE 类目标只检出、不修改，与 Linux 侧同策略。pow 链（舰队实力）的等价饱和实现风险高，故意不做。
-- 正常游玩不会触发任何 EVENT：原版量级离溢出阈值差十几个数量级。要看到效果需要 mod 把数值推到 ~9.2e17。
+## 已知限制与免责声明
+
+- **严格绑定游戏构建**：Windows 版依靠 PE 时间戳与 16 字节序言签名双重校验；游戏更新后不匹配的目标会被自动跳过并记录日志，确保不乱读写内存，但需要重新定位并更新插件。
+- **无法覆盖全部内联算术**：`CFixedPoint` 的基础运算符广泛内联，插件只能守住关键关口，无法替换所有内联展开副本。
+- **封顶值的物理上限**：`INT64_MAX`（约 92.2 万亿游戏单位）是游戏自身定点格式的物理天花板，超越上限时只能饱和停留于此值。
+- **回写策略偏保守**：宁可漏报、绝不误改；OBSERVE 类目标（如舰队实力幂函数 `CalcMilitaryPowerExponent`、外交权重等）仅做观测，不主动篡改数值。
+- **建议备份存档**：使用回写版前建议备份重要存档；本项目尚未与其它第三方原生 DLL 插件做全面并发兼容测试。
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。非官方项目，与 Paradox Interactive 无关。
+MIT License，见 [`LICENSE`](LICENSE)。第三方组件 `EirinMath` 遵循其自带 MIT 许可。本项目为非官方社区工具，与 Paradox Interactive 无关。

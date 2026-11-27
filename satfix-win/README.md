@@ -1,1546 +1,280 @@
 # satfix-win —— Stellaris 定点溢出守卫（Windows DLL 插件）
 
-把 [`../satfix`](../satfix)（Linux 的 `LD_PRELOAD` 定点算术饱和注入）迁移到 Windows，
-按 [`stellaris-launcher/docs/PLUGIN_HANDBOOK.zh-CN.md`](../../stellaris-launcher/docs/PLUGIN_HANDBOOK.zh-CN.md)
-（插件规范 v2）做成合规的启动器插件。
+`satfix` 的 Windows x64 实现，遵循 [Stellaris Launcher 插件手册 v2](https://github.com/Yidhar/stellaris-launcher/blob/main/docs/PLUGIN_HANDBOOK.zh-CN.md) 构建。
 
-发布版是回写模式：`build.ps1 -Replace` 编出来的 DLL 会在检出溢出时把数值改写回饱和值。
-不带参数编出来的影子模式只观测、只记日志，是开发自测用的，不随发布包分发。
+- **当前插件版本**：`v0.5.0`（`satfix — Fixed-Point Overflow Guard`）
+- **当前适配游戏**：**Stellaris Cygnus v4.6.0**（`stellaris.exe` PE 时间戳 `0x6AF6BDEC`）
+- **Hook 覆盖**：**19 个已确证目标**（EXACT 9 / INPUT_GUARD 1 / OBSERVE 9）+ **6 个辅助函数**；全部通过汇编转发桩安装，确保零寄存器破坏。
 
-| 文件 | 作用 |
-| --- | --- |
-| `winhook.hpp` | `shk.hpp` 的 Windows/x64 移植：入口 5 字节 `E9 rel32` → relay → 蹦床 |
-| `satfix128.hpp` | MSVC 上的 128 位中间量算术（`_umul128`/`_udiv128`，替代 GCC 的 `__int128`） |
-| `stl_fix_win.hpp` | 定点饱和语义（`stl_fix.hpp` 的移植，去掉 eirin 依赖） |
-| `src/sat_guard_win.cpp` | 插件本体：DllMain / 日志 / 配置 / detour / 主线程泵 |
-| `src/satfix_targets_win.generated.hpp` | 自动生成，勿手改（RVA + 序言签名） |
-| `test/test_winhook.cpp` | hook 引擎自测（合成机器码，25 项） |
-| `test/test_stl_fix_win.cpp` | 定点算术离线对拍（57 项） |
-| `test/test_load_plugin.cpp` | 插件管线自测（宿主 LoadLibrary，23 项） |
-| `tools/win_dump_index.py` | 给 Windows 反编译 dump 建函数索引 / 按 RVA 取函数体 |
-| `tools/win_fingerprint.py` | 用定点常量指纹在 110843 个函数块里筛候选 |
-| `tools/gen_targets_win.py` | 生成目标表；`--check` 校验 RVA/签名是否仍匹配 exe |
-| `tools/check_plugin_pkg.py` | 插件包合规检查（手册第 13 节可自动化的部分） |
-| `plugin/` | 插件包：`stl-plugin.json` + `satfix.dll` + `defaults/` |
+> 历史逆向定位证据、6 次 ABI / 偏移踩坑复盘、LTCG 寄存器保全事故分析以及 4.5.2 → 4.5.3 → 4.6.0 演进详情已独立归档至 [`docs/ENGINEERING_NOTES.md`](docs/ENGINEERING_NOTES.md)，本文档聚焦当前版本的架构、行为与操作说明。
 
 ---
 
-## 0. 当前状态
+## 1. 目录与核心模块
 
-第 3、5、6 节写的是 0.1 那一轮之前的进度，目标数量和定位结论以本节为准。
-
-### 0.0 本轮（0.2.0 发布）的四个实质变化
-
-这一节是**当前状态**，下面 0.1.x 各节是历史证据记录（数字可能停留在当时那一轮）。
-四个变化的详细证据分别在 0.1.12 ~ 0.1.15。
-
-#### 变化 1：护盾/装甲上限改成「忠实重算 + 回写饱和值」（船体只做近似重算）
-
-旧实现 `detour_max_hp` 只做 `if (v < 0 || v > cap)` 的阈值检查，既不重算也不回写 ——
-所以「溢出后变成 0 / 负数」这类症状它根本修不了。新实现（设计迁移自 Linux 版）改成：
-
-- 用**游戏自己的原语**饱和重算上限，与游戏写回的值做**等值比对**，不相等 = 原版那一步 wrap 了；
-- 重算链：`size = ship_size_of(design)` → `base = *(design + off)` →
-  `base += modifier_value(size, mods, type_a)` → `add = modifier_value(size, mods, type_b)` →
-  `factor = add + 100000` → `result = base × factor / 100000`。
-
-三个函数各自的常量**由读 Windows 函数体得出，不是照抄 Linux**（巧合与 Linux 一致，但那是核对出来的）：
-
-| | design 偏移 | 加算 type | 乘算 type | 条件性船级修正 |
-|---|---|---|---|---|
-| hull | `0x10` | `0x1e` | `0x1f` | —（它的船级修正就是下方那张等级表，已建模） |
-| shield | `0x130` | `0x2e` | `0x2f` | `0x1c8` / `0x1c9` |
-| armor | `0x70` | `0x24` | `0x25` | `0x1c6` / `0x1c7` |
-
-还有一张**按舰船等级索引**的额外乘算修正表，三个函数形状相同、只有表地址不同：
-`bVar1 = *(byte*)(design + 0x468)`，表地址 shield `0x28167ac` / armor `0x2816774` /
-hull `0x281673c`。**漏掉它会让重算系统性偏小** —— 实测 游戏 = 21304430712 而重算 =
-1782290712（差 13 倍），这正是船体此前一直「重算 ≠ 游戏」的原因。注意这一段在游戏里是
-**内联**展开的，结尾不做 `modifier_value` 内部那一项相加，所以不能直接复用辅助函数，必须自己扫表。
-
-实机验证：**护盾/装甲**的 `sat == 游戏` 逐位一致（6023400000 / 6023399996 / 75000000 / 13808500 四例全中）。
-
-⚠️ **船体不在这个结论里**。船体的算式比护盾/装甲多出三段**条件性累加**，本配方没建模（见下方「已知限制」）。
-所以船体的 `sat` 是**偏小的近似值**，不是逐位忠实。它目前只有「没误伤」这一条实测证据
-（110 万次调用、零 EVENT），**没有「溢出时修对了」的实测证据**。
-
-#### 变化 2：「护盾塌成 0」的根因与修复
-
-根因是三步，缺一不可（用户实测确认）：
-
-1. 加算修正真值 > 9.2e13 游戏单位（= `INT64_MAX/1e5` = 92233720368547），游戏自己的 mul
-   在拆分路径上 wrap 成**负数**；
-2. `GetModifierValue` 对掩码类型有兜底 `if (v < 0) v = 0`（反编译 `FUN_140d29dd0`），整项被夹成 **0**；
-3. 上限 = `(base + 0) × 倍率` = 0 —— 倍率再大也是 0。
-
-用户原话「吃了一个 buff 计算大于 92 万亿溢出了」，与 `INT64_MAX/1e5 = 92233720368547` 精确吻合。
-
-实测证据（同一存档、同一条 design 指针）：
-
-| | 装甲加算 `0x24` | 护盾加算 `0x2e` | 护盾乘算 `0x2f` |
-|---|---|---|---|
-| 正常舰船 | 2861907747 | 2861907747（两者相同） | — |
-| 出问题那台 | 11000000000 | **0**（被塌掉） | 1000000000000000（1e10 游戏单位 = 1e12%） |
-
-修复判据：**加算读到 0 + 倍率 ≥ 1e7 倍 → 封顶到 `INT64_MAX`**。这条判据只对「值住在加算项」的
-目标（护盾/装甲）生效 —— 船体的加算项**正常就是 0**，用同一条会误伤，已用 `add_carries_value`
-标志按目标分别开关。
-
-实机验证：护盾 `0` → `92233720368547`（用户截图确认），且只有 `CalcMaxShieldHitPoints` 触发，
-船体/装甲零误报。日志形如：
-
-```
-EVENT CalcMaxShieldHitPoints 加算溢出塌成 0（倍率=1000000000100000 = 10000000001.00 倍）-> 封顶到 9223372036854775807 [已回写]
-```
-
-#### 变化 3：新增第 18 个目标 `damage_per_day`（设计师面板的「伤害」）
-
-定位方法（踩过一次坑，值得记）：
-
-- **第一版是错的**：按独占常量 `0xb50679d3` 全库搜，挑了行数最接近的 `FUN_1403c2910`（851 行）。
-  实测打开舰船面板时它算的是「单件武器」的倍率（读到 24.5 / 19.5 这类小值），面板那个大值
-  从不出现在它里面。
-- **改正方法**：三个上限函数都在 `NShipUtil` 片区，伤害也该在附近。扫 `0xA00000..0xA20000`
-  这 218 个函数，只看有定点乘法或调 `FUN_140d29f10`/`FUN_140d29dd0` 的，得到 `FUN_140a14c60`
-  （614 行），紧跟 `CalcMaxSpeed(0xA14150)` 之后。
-- **决定性判据：ModifierType 序列逐个相同**。Linux `CalcAverageDamagePerDay` 依次取
-  `0x3a / 0x40 / 0x168 / 0x41 / 0x1d2 / 0x1d3 / 0x230`（7 个）；Windows `FUN_140a14c60` 是
-  **完全相同的 7 个、相同顺序**。（先前那个错的只用了其中 3 个。）
-- **溢出点**：L594-596 `lVar8 = (plVar10 * plVar13) / 100000` 是裸 64 位乘，没有饱和。
-- **实机抓到**（同一函数连续三次调用）：`*ret = 2078190048`（20781.90，正常）→
-  `*ret = 19158706009081.23`（wrap，EVENT 触发）。用户确认「去掉射速的 buff 肯定就正常了」。
-- **ABI**：sret，`long long* fn(ret /*rcx*/, design /*rdx*/, mods /*r8*/, fleet /*r9*/,
-  char /*栈*/, void* /*栈*/)`，与三个上限函数同形。
-
-**修复**：`*r` 是函数的 sret 返回槽（`return param_1`），**专门放返回值**，不是共享结构字段 ——
-写它不会碰到别的统计项。判据硬：伤害不可能为负，负值或 > 9.2e13 游戏单位必然是 wrap，封顶到
-`INT64_MAX`。实机验证：伤害 `-4380077663777.92` → `92233720368547.75/秒`（用户截图确认）。
-
-**「只影响显示，不影响实际伤害」的三条证据**（用户专门问过）：
-
-1. 面板调度器 `FUN_1411519f0` 把结果写进**栈上临时槽 `local_res8`**，然后 `return 1`（状态码）——
-   数值传不出去。同一个调度器里，船体/护盾/装甲/速度/伤害等六项是同一形态的独立调用
-   （各对应一个 `param_1 + 0x6xx` 字段）。
-2. 调用 `FUN_140a14c60` 的 8 个函数**全是 UI 层**（含 `HEADER`/`TOTAL_VALUE`/`VALUE`/
-   `GROWTH_THRESHOLD_BASE_TOOLTIP` 这类工具提示串，或就是那个面板调度器）。**一个战斗函数都没有**。
-3. 战斗伤害走 `TakeDamage`/`DealDamage` 那条完全不同的链，读的是武器组件原始值。
-
-**顺带澄清的设计问题**：面板那一格本来就是「总和」（函数内 L576 `*param_1 = *param_1 + *plVar13`
-就是组件累加），而 `CFixedPoint` 是 int64 定点，格式天花板就是 `INT64_MAX` ——「单组件上限 × N」
-在数学上做不到，超过就立刻再 wrap。所以封顶值只能是 `INT64_MAX`（92 万亿游戏单位），这是物理天花板。
-
-#### 变化 4：性能修复（用户反馈「过一天的时间变长、流畅度降低」）
-
-两处开销：
-
-1. **重算在正常舰船上纯属浪费**。所有回写分支都要求 `v <= 0`（塌成 0 需要 `add_in == 0`
-   且 base 恒为 0 → 游戏值必然是 0；wrap 要求 `v < 0` 或 `v == 0`），而正常舰船 v 是正数
-   （实测 6023399996 等）。热路径函数每局被调用百万到千万次，每次重算要 4~6 次游戏函数调用
-   （含一次虚调用）+ 扫 46 项修正表。现在 `v > 0` 直接返回，开销降到一次比较。
-2. **`safe_read` 每次都做 `VirtualQuery`（内核态切换）**。新增 `fast_read`：只用 SEH 兜坏指针，
-   正常路径几乎零开销。热路径全部改用它（地址来自游戏传入的指针，可信）；来自我们解析的
-   RVA / 猜测偏移的读**仍然必须**走 `safe_read`。
-
-实测（心跳累计调用数，同一存档同一进程）：快路径 273,333 调用/秒 vs 慢路径 256,667 调用/秒。
-用户主观确认：「优化以后 1 天的速度明显快很多」。
-
-### 已实机验证过的部分
-
-* Windows hook 引擎可用：合成机器码自测 25/25 通过（rel8 加宽、线程挂起式补丁、卸载后可重装、坏目标拒绝）。
-* 定点饱和算术与 Linux 版语义一致：离线对拍 58/58 通过。
-* 判定逻辑在真进程里自检通过：14 组向量表在游戏进程内跑，日志 `判定逻辑自检：全部通过`。
-* **19 个目标**全部装上，且全部确认真被游戏代码调用（`共装上 19/19 个钩子（跳过 0）`）；
-  6 个辅助函数签名校验 `6/6`；启动日志另报 `未定位 1`（已判定 Windows 侧无对应代码，非缺口）。
-* `REPLACE=1` 回写路径也实机跑过（0.5），且这一轮拿到了**真实 EVENT**（不再只是「不崩」）。
-* 一局后期 mod 存档的实测统计见 `EVIDENCE_live_gameplay.txt`（0.1 那轮，十七目标构建）：
-
-  ```
-  累计 23.9M 次调用（0.2.0 十七目标构建）：
-      Atan2                          3652911
-      ApplyModifierMult(cfx)         1457768   <- 主战场，数值放大的真正出口
-      CalcMaxShieldHitPoints         1002320   <- 本轮新增
-      CalcMaxArmorHitPoints          1002320   <- 本轮新增
-      CalcMaxHitPoints               1002320   <- 本轮新增
-      GetRounded/GetRounded64         149490
-      add_variable                     15318
-      Sqrt                              3188   <- 本轮新增
-      SafeSqrt                          1173
-      CalcDiplomaticWeight             390256   <- NDefines 名字法
-      CalcMilitaryPowerExponent<15>   1625512   <- NDefines 名字法 + 编码判据
-      CalcMilitaryPowerExponent<7>    1562356   <- 同上
-      multiply_variable                 8595
-      GetRounded(fp15)                  6337
-      RoundTo                           4950
-      ApplyModifierMult(fp15)              0   <- 该重载在此存档未被走到
-  ```
-
-  0.1 那一轮：正常游玩期间 0 条真实 EVENT，与 Linux 侧判断一致（原版量级离阈值极远，要 mod 把数值
-  推到 ~9.2e17 才会溢出）。0 条 EVENT 是预期结果，并不说明钩子没装上，后者由首次调用
-  心跳与自检排除。
-
-  0.2 这一轮（18 目标构建）的实机日志：
-
-  ```
-  目标: 签名校验通过 18/18，未定位 1（见下），本构建适配 18
-  辅助函数: 签名校验通过 6/6（变量系统 EXACT 可用）
-  共装上 18/18 个钩子（跳过 0）  [REPLACE 已开]
-
-  --- heartbeat: 100000 次调用，溢出 6770 次 ---
-        GetRounded/GetRounded64              78
-        ApplyModifierMult(cfx)               20968
-        Atan2                                4
-        CalcMaxShieldHitPoints               19507
-        CalcMaxArmorHitPoints                19506
-        CalcMaxHitPoints                     19507
-        Sqrt                                 2
-        SafeSqrt                             2
-        CalcDiplomaticWeight                 100
-        CalcMilitaryPowerExponent<15>        442
-        CalcMilitaryPowerExponent<7>         9950
-        CalcAverageDamagePerDay              9934
-  ```
-
-  这一轮 EVENT 有两条来源：`CalcMaxShieldHitPoints 加算溢出塌成 0` 与
-  `CalcAverageDamagePerDay 伤害溢出 -> 封顶`（见 0.0 变化 2、变化 3）。日志上限 20000 行，
-  事件按 design 指针限流（面板每帧都会重算同一个 design）。
-
-### 0.1 目标清单与它们的实机证据
-
-策略分布：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**（以 `src/satfix_targets_win.generated.hpp` 为准）。
-另有 6 个辅助函数只解析地址、不装钩子；未定位 1 个（`cfx_safe_sqrt_int`，已判定 Windows 侧无对应代码）。
-
-| 目标 | RVA | 策略 | 实机验到的 |
-|---|---|---|---|
-| `cfx_get_rounded` | `0x1B4C170` | EXACT | 3 条 EVENT，边界精确在 `x ≥ 9223372036854725808` |
-| `cfx_to_fp15` | `0x1B4C0A0` | EXACT | 4 输入全匹配模型，0 分歧 |
-| `apply_mul_cfx` | `0x36DF80` | EXACT | 一局内 145 万次调用（主战场） |
-| `apply_mul_fp15` | `0x36E0A0` | EXACT | 已装上；该存档内 0 次（重载未被走到） |
-| `cfx_round_to` | `0x1B4C1B0` | OBSERVE | 探针 `1234567,div1000→1235000,q1235`；实测 4950 次 |
-| `cfx_atan2` | `0x1B4C2D0` | OBSERVE | 探针 `(1.0,1.0)→78539`(=π/4×1e5)；实测 365 万次 |
-| `cfx_get_rounded_fp15` | `0x1B4C100` | OBSERVE | 实测 6337 次 |
-| `var_multiply` | `0x1777F00` | **OBSERVE** | 实测 8595 次；SAMPLE 证明读回链自洽（0.1.4）。**当前策略是 OBSERVE** —— 见 0.1.4 的说明 |
-| `var_add` | `0x1777800` | **OBSERVE** | 实测 13003 次；SAMPLE 三次 v0 递推自洽（0.1.4）。**当前策略是 OBSERVE** |
-| `shield_max` | `0xA11D80` | **EXACT** | 实测 100 万次；本轮升级为忠实重算 + 回写（0.0 变化 1、2） |
-| `armor_max` | `0xA12910` | **EXACT** | 实测 100 万次；同上 |
-| `hull_max` | `0xA112A0` | **EXACT** | 实测 110 万次；重算是**近似**（漏三段条件累加，见已知限制），无溢出实测 |
-| `cfx_sqrt` | `0x1B489D0` | INPUT_GUARD | 探针 √1.0→1.00001、√100000→316.22927（误差 4.6e-6）；负值触发守卫 |
-| `cfx_safe_sqrt` | `0x1B4C600` | OBSERVE | 探针 √100000→316.22790（误差 4.4e-7，比 Sqrt 更准） |
-| `diplo_weight` | `0x838670` | OBSERVE | 实测 39 万次（用户实测最易溢出的那个） |
-| `mpe15` | `0xA0A4A0` | OBSERVE | 实测 162 万次（fp15 舰队实力指数） |
-| `mpe7` | `0xA0A610` | OBSERVE | 实测 156 万次（fp7 舰队实力指数） |
-| `damage_per_day` | `0xA14C60` | **EXACT** | **第 18 个目标**；面板「伤害」负值 -> 封顶（0.0 变化 3） |
-| `ship_size_max_hp` | `0xD2B6E0` | **EXACT** | **第 19 个目标**；`max_hitpoints` **源头**负值 -> 封顶（0.1.16）。偏移 0x6b8 由静态推导 + 活体探针双证，**不是** Linux 的 0x678。溢出侧已用专门测试 mod 实测（`-84467440737095.51` -> `92233720368547.75`） |
-
-> 6 个辅助函数（只解析地址、不装钩子）：`access_var_pointer` `0x9F7DF0`、
-> `cvars_get` `0x227390`、`cvars_set` `0x7AAE10`、`cfp_getvalue` `0x34D500`（变量系统用）；
-> `ship_size_of` `0x30E990`、`modifier_value` `0xD29DD0`（**上限重算链用**，0.0 变化 1）。
-
-### 0.1.2 本轮的方法突破：唯一常量集与调用者定位
-
-前几轮靠函数体形状猜，屡屡失败（75 个同形状候选、293 个守卫对候选）。本轮换成两条可证伪
-的路子，都成功了：
-
-1. **唯一常量集**（用于 `armor_max` / `shield_max` / `hull_max`）。Linux 版体内含有 CShipSize
-   修正类型表的索引常量（ModifierType 枚举值），三个函数各有一组互不相交的常量。把
-   `0x15fec/0x15ff8/0x160a8` 三个常量同时作为检索条件扫过全部 110843 个函数块，命中数为 1，
-   就是 `0xA12910`。shield/hull 用同样的办法各命中 1 个。两条独立签名互相印证（表偏移 +
-   从 `param_2` 读的结构偏移，与 Linux 逐字相同）。
-2. **helper 调用组合**（用于 `var_add`）。先拿已确证的 `var_multiply`，从它的调用点读出
-   4 个 helper 的 RVA，再找同时调用这 4 个的函数。命中变量效果家族，其中不含乘法安全域
-   常量的 26 行成员只有两个，读体区分加/减（`value + var` vs `var - value`）即可确定。
-
-### 0.1.3 一个必须记下的教训：`var_multiply` 的旧 RVA 装错了函数
-
-`0x00231640` 是错的。它的体内有 `type*0xb0 + 0x9c + DAT_142814390` 的 CModifier 类型表
-掩码查表，并就地累加 `*(param_1+0x38)` 的 0x10 步长数组，那是 CModifier 惯用法，不是变量系统。
-
-发现方式：Linux `CMultiplyVariableEffect::ExecuteActual` 里有一条独占诊断串
-`multiply_variable: variable %s is not set for scoped %s '%s' at %s`。
-按该串在 Windows dump 里检索，唯一命中 `0x1777F00`，其体形与 Linux 逐条对应
-（4 个 helper 的调用序一一对上）。
-
-教训是函数体看起来像（同常量、同惯用法）不等于身份。`0xb504f333/0x16a09e667` 这对常量
-在 dump 里到处都是（乘法安全域判断），任何以它为核心的指纹都没有区分度。真正有区分度的
-是独占字符串、类型表索引常量集、已确证函数的 helper 调用组合这三类。
-
-### 0.1.4 变量系统打通了读回链（读回通了，但**策略仍是 OBSERVE**）
-
-> ⚠️ **本节标题是历史措辞，结论已更正**：这一轮把 `var_add` / `var_multiply` 的读回链打通了
-> （当时写成「升级成真 EXACT」），但 `src/satfix_targets_win.generated.hpp` 里这两个目标
-> **当前是 `kObserve`**。降级理由（以 generated 头与 `gen_targets_win.py` 为准）：EXACT 依赖
-> **先读到 `v0`** 再复算饱和加法/乘法，而 Windows 上 `v0` 的读取路径是
-> `FUN_140227390` + 名字 `CString` 布局，尚未验证；贸然 EXACT 会写坏存档。先用 OBSERVE 计数、
-> 看实机量级，确认 helper 语义后再升级。下面的 SAMPLE 证据仍然有效 —— 它证明的是**读回链自洽**，
-> 不是「已经按 EXACT 回写」。
-
-上一轮 `var_add` / `var_multiply` 还只能 OBSERVE，卡在读不回变量当前值。这一轮读回链通了：
-辅助函数的 RVA 是从已确证目标的调用点读出来的，不是猜的。`var_multiply(0x1777F00)`
-体内按 Linux 的调用序调用四个 helper，逐个对得上：
-
-| Linux | Windows | ABI |
-|---|---|---|
-| `AccessVariablePointer(scope, name)` | `0x9F7DF0` | `longlong fn(scope, name)` |
-| `CVariables::GetVariable(name)` | `0x227390` | `longlong* fn(vars+8, out, name)` |
-| `CVariables::SetVariable(name, v)` | `0x7AAE10` | `void fn(vars, name, value)` |
-| `CFixedPointVariableValue::GetValue(scope)` | `0x34D500` | `longlong* fn(this+0xf0, out, scope)` |
-
-（`cvars_get` 的读偏移是 `entry + 0x38`，`cvars_set` 的写偏移是 `entry + 0x38`，两侧互为印证。）
-
-两个关键偏移由读、写两侧互相印证得出：变量条目 +4 是「已设」标志（== -1 表示未设，
-游戏按 0 参与运算），条目 +0x38 是 CFixedPoint 值（`GetVariable` 的读偏移与 `SetVariable`
-的写偏移在反编译里是同一个数）。
-
-这次的 0 条 EVENT 不能算证据：影子读法可能整体读错位置，那样也会永远一致。所以加了
-有界 SAMPLE 日志（每个操作最多 3 行），实机拿到的是自洽链而不是空白：
-
-```
-SAMPLE add_variable      v0=0             d=100000 game=100000       sat=100000       一致
-SAMPLE add_variable      v0=100000        d=100000 game=200000       sat=200000       一致
-SAMPLE add_variable      v0=200000        d=100000 game=300000       sat=300000       一致
-SAMPLE multiply_variable v0=7345573000000 d=100000 game=7345573000000 sat=7345573000000 一致
-```
-
-三次 `add_variable` 的 v0 依次是上一次的写回值（0 → 100000 → 200000），
-证明读回链真的接在游戏状态上，而不是读了个常量槽。
-（`v0=7345573000000, d=100000 → 7345573000000` 就是 ×1.0，量级也合理。）
-
-### 0.1.5 本轮证伪的三条定位思路（留档，别再走）
-
-1. Linux 里的立即数这类指纹对 MSVC 不可移植。`mpe15` 在 Linux 里有 `0x7fffffff8000` / `0xffffffffffff8000`（fp15 符号保留右移），在 Windows dump 里出现 0 次，MSVC 把 `(x>>15)` 编成 SAR 指令加事后掩码，不写立即数。同理 `mpe7` 的 `0x7fffffff80` 也是 0 次。
-2. Linux 的成员偏移不能直接搬到 MSVC。`diplo_weight` 的 `+0x808` 且 `+0xec` 且 `+0xe0` 组合在 Windows 侧命中 0 个，已知的布局差异有 `+0xb8→+0xc0`、`+0xe8→+0xf0`。
-3. 按间距找邻居不可靠。Linux `var_multiply`(91 行) 与 `var_add`(26 行) 相距 0xDF0，Windows 对应的两个函数体量不同（99 行 / 26 行），间距不可移植。
-
-真正管用的三类判据是独占字符串（`var_multiply` 的
-`multiply_variable: variable %s is not set…`）、类型表索引常量集（`armor_max` 的
-`0x15fec/0x15ff8/0x160a8` 三常量同现，全库唯一）、已确证函数的 helper 调用组合
-（`var_add`：先提取 4 个 helper RVA 再找同类），本轮全部命中唯一解。
-
-### 0.1.6 `cfx_sqrt` / `cfx_safe_sqrt`：调用者法第二次奏效，外加一次 ABI 踩坑
-
-定位沿用 `apply_mul_cfx` 那套靠调用者的办法。Linux 里调用 `CFixedPoint::Sqrt` 的只有
-4 个函数，其中 `CalcDistance` 同时调用 `Sqrt` 与 `SafeSqrt`，且带独特常量
-`0xf4241`(=1000001)。按该常量在 Windows 侧得到 3 个候选，其中一个含 CFixedPoint 专属
-魔数 `0x29f16b11c6d1e109`，读体确认是 `CalcDistance` 同构体，它调用的 `FUN_141b489d0`
-就是 `Sqrt`。再由 `Sqrt` 的调用者顺出 `FUN_141b4c600` = `SafeSqrt() const`
-（常量 `0x2711`/10000/1000/2999999999 与 Linux 逐个对上）。
-
-踩的坑是活体探针抓出来的：我把两个函数都按 `(out, src)` 写，`Sqrt` 是对的，`SafeSqrt`
-反了。探针立刻暴露，它的返回槽一直是我预置的哨兵 `0x5A5A5A5A5A5A5A5A`
-（= 6510615555426900570），五个输入全都返回同一个数。看函数体才发现 `Sqrt` 是
-`*param_1 = result`（out 在 rcx），`SafeSqrt` 是 `*param_2 = result`（src 在 rcx、out 在 rdx）。
-
-> 同一个类里的相邻成员，参数顺序不一定一致。必须逐个按函数体定签名，不能因为它们是兄弟
-> 函数就类推。
-
-修正后的探针数值（这才是 ABI 正确的证据）：
-
-| 输入 | `Sqrt` | `SafeSqrt` | 真值 |
-|---|---|---|---|
-| 1.0 | 100001 | 100001 | √1 = 1.0 OK |
-| 100000.0 | 31622927（误差 4.6e-6） | 31622790（误差 4.4e-7） | √100000 = 316.227766 |
-| 1（=1e-5） | 0（走 `1 < x` 守卫） | 317（0.00317） | √1e-5 = 0.003162 OK |
-| -1 | 0，INPUT_GUARD 触发 | 0 | OK |
-
-`SafeSqrt` 比 `Sqrt` 更准，这正是它先缩放进安全域再算的设计目的。两个函数都返回真
-平方根，身份与语义双双确证。
-
-### 0.1.7 `cfx_safe_sqrt_int`：Windows 侧不存在这个函数（已内联）
-
-Linux 版它只有 10 行：`if (p > 0) { x = p*100000; return SafeSqrt(&x); } return 0;`。
-`Sqrt` 与 `SafeSqrt` 的全部调用者都已枚举并逐个读过体，没有任何一个是这个 10 行包装
-（`SafeSqrt` 的 7 个调用者都是大函数，最小 43 行）。MSVC 把这种小包装直接内联进调用者
-是常规做法。
-
-所以 Linux 侧针对它的 INPUT_GUARD 在 Windows 上无处可装。这不是没找到，是确实不存在。
-等价保护已被覆盖：内联展开后真正做 `p*100000` 的那一步，其结果要么进 `SafeSqrt`
-（已装 OBSERVE）、要么进 `Sqrt`（已装 INPUT_GUARD）。
-
-### 0.1.8 `diplo_weight`：NDefines 名字法（本轮第三个方法突破）
-
-这是用户实测后期最容易溢出的目标，也是最难的一个。它在 Linux 里没有任何直接调用者
-（只有 4 处提及，全是它自己），所以调用者法完全无效；按守卫密度筛出 24 个候选、
-按结构偏移 `+0x808` 命中 0 个。
-
-突破口是 Paradox 的 NDefines 名字字符串。这类名字（`DIPLOMACY_WEIGHT_POP_BASE` 等）
-确实以明文存在于 exe 的 .rdata 里。流程是在 .rdata 里找到名字字符串的 VA，扫 .text 找
-rip-relative 引用它的指令（每个名字只有 1 处），反汇编那处看到的是一个 5 指令 thunk：
-
-```
-mov rcx, rdx
-lea r9,  [全局地址]        <- 该 define 的**存放位置**
-lea rdx, ["NGameplay"]     <- 所属组
-lea r8,  ["<define 名>"]
-jmp <注册函数>
-```
-
-名字到全局地址的对应关系就这样被直接读出来了，不是猜的：
-`DIPLOMACY_WEIGHT_POP_BASE → 0x143151010`、`DIPLOMACY_WEIGHT_POP_HAPPINESS → 0x143151008`。
-接着在全部 110843 个函数块里找同时读这两个全局的函数，命中数为 1。
-
-结果是 `FUN_140838670`，体形与 Linux 1177404-1177484 逐条对上：`param_3+8` 虚调用、
-`param_1+0x18` 取 CJobType、`param_1+0xec` 计数 / `param_1+0xe0` 数组（这两个偏移与 Linux
-完全相同）、`(arr)[i*2+1] * 100000`、`* DAT_143151010 / 100000`、`FUN_14067eec0`
-（= `CPopGroup::HasHappiness`）、`* DAT_143151008 / 100000`、`*(param_3+0x8b0)` 再乘、
-求和写回 sret。
-
-顺带解答了上一轮的疑问：Linux 读 `param_10+0x808`，Windows 读 `param_3+0x8b0`，这就是
-为什么按 `+0x808` 检索命中 0 个。MSVC 布局差异又一次得到实证。
-
-> 可复用的方法：任何 Paradox 的 `NDefines::<组>::<名字>` 静态成员，都能用
-> `.rdata 名字字符串 → .text 里的 thunk → r9 里的全局地址` 三步定位。这比函数体指纹可靠
-> 得多，因为它读的是编译器自己写的元数据。
-
-### 0.1.9 `REPLACE=1` 实跑 + 又一个真并发 bug
-
-`REPLACE=1` 构建实机跑过：15/15 钩子（`[REPLACE 已开]`），3.5M 次调用，0 条 EVENT、
-0 次 replaced，游戏全程稳定。
-
-> 0 次 replaced 是正确行为，不是失效。正常游玩离 int64 溢出阈值差十几个数量级，回写
-> 路径本来就该一次都不走。回写代码的正确性由离线对拍 58/58 + 判定自检 14 组覆盖，
-> 实机这一趟验的是开着回写不崩、不写坏状态。
-
-抓到的 bug 是日志并发交错，症状是日志里出现
-
-```
-      CalcDiplomaticWeight                 50986[satfix] --- heartbeat: ...
-```
-
-根因是 `log_line_raw` 早先是三次独立调用（`fputs` 前缀 / `fputs` 正文 / `fputc` 换行），
-而 detour 跑在多个游戏线程上，两个线程会插在中间。上一轮只把正文拼成一块，前缀那步
-仍是独立调用，所以没修干净。
-
-修法是整行（前缀 + 正文 + 换行）先拼进一个缓冲，再一次 `fputs`；并加 `SRWLOCK` 让
-行数检查加写入成为临界区，避免两线程同时越过行数上限，或同时用同一个缓冲。
-
-验证：修后实机 0 条畸形行（`\d+\[satfix\]` 匹配数 = 0），心跳块完整。
-
-### 0.1.10 `mpe15`/`mpe7`：把 NDefines 名字法做成通用工具
-
-这两个目标前两轮完全卡住：调用者法无效（调用者不带独占字符串），常量法无效（Linux 的
-`0x15bf1` 与 `0x7fffffff8000` 在 Windows 侧都是 0 次），递归判据无效（73 个自递归函数里
-没有一个是它）。
-
-本轮把 `diplo_weight` 用的 NDefines 名字法做成通用工具，一举破局：
-
-1. 先把 thunk 解析器写对。关键 bug 是字符串地址必须经 RVA 到文件偏移转换，不能直接用
-   `va - ImageBase`：`.rdata` 的 raw/virtual 对齐不同（本例差 0x2000），我最初正是踩了
-   这个，得到的是垃圾名字。用已独立确证的 `DIPLOMACY_WEIGHT_POP_BASE/HAPPINESS` 做校准，
-   解析器给出的 `0x143151010` / `0x143151008` 与前面两次独立确证完全一致，解析器可信。
-2. 共提取 2369 个 (名字, 组, 全局地址) 三元组，含 31 个 `MILITARY_POWER*`，拿到
-   `MILITARY_POWER_EXPONENT → 0x1431505B0`（组 = `NShip`）。
-3. 唯一读它的函数 `FUN_140a08960` 把这个 define 当指数传给 `FUN_140a0a610`，那就是幂函数。
-4. 用移位宽度判精度：`FUN_140a0a610` 是 `<<7`/`>>7`/`0x80`/`0x7f`，是 fp7，即 `mpe7`；
-   紧邻的 `FUN_140a0a4a0` 是 `<<0xf`/`>>0xf`/`0x8000`/`0x7fff`，是 fp15，即 `mpe15`。
-
-编码判定与 Linux 完全吻合：
-
-| | Linux 掩码 | Windows 移位 |
-|---|---|---|
-| mpe15 | `0x7fffffff8000` / `0xffffffffffff8000` | `<<0xf` / `>>0xf` / `0x8000` |
-| mpe7 | `0x7fffffff80` / `0xffffffffffffff80` | `<<7` / `>>7` / `0x80` |
-
-两边都是处理负指数 → 调 log2 辅助 → 累加收敛，收敛条件同为 `while (sum != next + sum)`；
-各自还有配套的 log2 辅助（mpe15 用 `FUN_140a0a770` fp15 版、mpe7 用 `FUN_140a0a840` fp7
-版，成对）。
-
-> ABI 踩坑第 4 次：Linux 是 `(out, 指数, 底数)`，Windows 是 `(out, 底数, 指数)`，顺序相反。
-
-实机：`<15>` 162 万次、`<7>` 156 万次，都被真实战斗代码大量调用，0 条分歧。
-
-### 0.1.11 收尾核查：三个缺口的真假 + 回写路径的端到端 A/B 证明
-
-逐条核对 Linux 的 24 项与 Windows 的 21 项（Linux 表里第一项 `key` 是宏占位，不是目标）。
-**这是 0.1 那一轮的数字**（当时 17 个目标 + 4 个辅助函数）；当前是 **19 个目标 + 6 个辅助函数**，
-新增的 `damage_per_day` 与两个上限重算辅助函数见 0.0。
-Linux 有、Windows 无的只有两个：
-
-1. **`cfx_get_rounded64`：不是缺口，已覆盖。** 把 `0x1B4C170` 的前 24 字节机器码在整个镜像里做字节搜索，全镜像只出现 1 次。说明 MSVC 的 COMDAT 折叠把 `GetRounded` 与 `GetRounded64`（Linux 里是两个独立地址 `0x04230860` / `0x042308b0`）合并成了一份代码。所以那一个钩子同时覆盖两者，它本来就只有一份。
-2. **`cfx_safe_sqrt_int`：已判定 Windows 侧无对应代码，不是缺口。**
-
-   定位方式是：Linux 侧 `SafeSqrt(long long)` 唯一的真实调用点是 `MTTHModifyNumber` 的
-   `case 0xf`（脚本 `sqrt` 运算符），该分支前有独占报错串
-   `script_value/MTTH/weight field: Cannot square root a number that is negative at %s`。
-   按该串在 Windows dump 里检索，唯一命中 `FUN_14033fd20`（Windows 的 `MTTHModifyNumber`）。
-
-   读它的 `case 0xf`：
-
-   ```c
-   case 0xf:
-     if (-1 < (longlong)*param_1) {                  // 非负才走
-         puVar4 = FUN_141b4c600(param_1, &local_20); // = SafeSqrt(CFixedPoint const&)
-         *param_1 = *puVar4;
-         return 1;
-     }
-     ... "Cannot square root a number that is negative at %s"   // 负值 -> 报错，不算
-   ```
-
-   它直接把 `param_1`（一个 `CFixedPoint*`）的地址传给引用版 `SafeSqrt`，没有
-   `p * 100000` 这一步。
-
-   | | Linux | Windows |
-   |---|---|---|
-   | 调用形态 | `SafeSqrt(param_9)`，实参是整数 `long` | `FUN_141b4c600(param_1, …)`，实参是指针 |
-   | 溢出点 | 函数内部做 `p * 100000` | 没有这一步 |
-
-   `case 0xf` 里 `param_1` 本来就是定点格式，值已在格式内，所以编译器直接用引用重载，
-   不需要整数到定点的换算，那个 `p*100000` 压根不生成。Linux 那条 INPUT_GUARD 保护的
-   是一步 Windows 编译器根本不会生成的运算。
-
-   而且 `case 0xf` 自己已有负值检查（负则报错返回，不计算），Linux 那个守卫要防的场景，
-   游戏在本路径上已自行防护。真正的 `sqrt` 求值路径已被 `cfx_safe_sqrt` 钩子覆盖（含
-   `x<0` 判定）。
-
-   为找内联副本做过的检索都失败，一并留档：(a) 精确签名 `0x2710` + `0xb504f333` +
-   `0x16a09e666` 三件套，全库仅 1 处（真函数本身），无内联副本；(b) 按 `SafeSqrt` 的
-   6 个调用点逐个反汇编，无一是 `p*100000` 形态；(c) 用 80 字节窗口搜出的 3 个疑似内联点
-   经读体确认是 `x*x` 乘法辅助函数（假阳性）。
-
-Linux 的 19 个 hook 目标在 Windows 侧全部覆盖。`cfx_get_rounded64` 因 COMDAT 折叠与
-`cfx_get_rounded` 同地址；`cfx_safe_sqrt_int` 在 Windows 侧无对应代码。
-
-#### 发现并关闭了一个真实的验证缺口
-
-此前「`REPLACE=1` 跑过 350 万次调用不崩」只证明了不崩，没证明真改对了值：影子模式下
-detour 照样返回 game 值，两者在日志上长得一样。
-
-新增探针：传 `INT64_MAX` 给 `GetRounded`，看返回值是 game 的 wrap 值还是我们的饱和值。
-`GetRounded` 是纯读函数（只读 `*param_1`、结果放返回值，不写回入参），所以判据看返回值。
-第一版探针错看成输出槽，已修正。
-
-A/B 实测（同一构建脚本，只差 `-Replace` 开关）：
-
-| 构建 | `GetRounded(INT64_MAX)` 返回 | 含义 |
-|---|---|---|
-| `REPLACE=0` | `-92233720368547` | game 的 wrap 值（就是那个 bug） |
-| `REPLACE=1` | `+92233720368547` | **饱和值（被纠正了）** |
-
-这是端到端证明：回写路径确实把一个溢出值纠正了。
-
-#### 策略分布与 Linux 对齐
-
-> ⚠️ 下面这张表是 **0.1 那一轮**的快照（当时 17 个目标），**已经不是当前状态**。
-> 当前策略分布见 0.1 开头：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**。
-> 两处变化：三个上限函数从 OBSERVE 升到 EXACT（0.1.12）、新增 `damage_per_day`（EXACT，0.1.14）；
-> 而 `var_add` / `var_multiply` 从 EXACT **降回** OBSERVE（0.1.4 的更正）。
-> 本表保留原样存档。
-
-| | EXACT | INPUT_GUARD | OBSERVE |
-|---|---|---|---|
-| Linux | 6 | 2 | 11 处钩子（含 `cfx_get_rounded64`） |
-| Windows | 6 | 1（`Sqrt`） | 10 |
-
-EXACT 集合完全相同（`cfx_get_rounded`、`cfx_to_fp15`、`apply_mul_cfx`、
-`apply_mul_fp15`、`var_add`、`var_multiply`），也就是能真正修数值的那部分能力已对等。
-`cfx_get_rounded64` 因 COMDAT 折叠与 `cfx_get_rounded` 同一地址，一个钩子覆盖两者。
-唯一的真缺口是 `cfx_safe_sqrt_int`（INPUT_GUARD 少 1 个），见上。
-
-### 0.1.12 三个上限函数升级成重算（护盾/装甲忠实；船体近似）
-
-旧 `detour_max_hp` 只做阈值检查（`if (v < 0 || v > cap)`），既不重算也不回写，所以
-「溢出后变成 0 / 负数」修不了。新实现用游戏自己的原语重算并等值比对，常量全部**读 Windows
-函数体得出**（不是照抄 Linux）：design 偏移 hull `0x10` / shield `0x130` / armor `0x70`；
-加算/乘算 ModifierType hull `0x1e`/`0x1f`、shield `0x2e`/`0x2f`、armor `0x24`/`0x25`；
-条件性船级修正 shield `0x1c8`/`0x1c9`、armor `0x1c6`/`0x1c7`；**船体还有三段条件累加未建模**，
-见「已知限制」。完整表格见 0.0 变化 1；实机逐位一致的四例**只覆盖护盾/装甲**。
-
-**踩过的两个坑**：
-
-1. **漏掉按舰船等级的额外乘算修正表**。`bVar1 = *(byte*)(design + 0x468)`，表地址 shield
-   `0x28167ac` / armor `0x2816774` / hull `0x281673c`。漏掉它重算会**系统性偏小** ——
-   实测 游戏 = 21304430712 而重算 = 1782290712（差 13 倍）。这一段在游戏里是内联展开的，
-   结尾不做 `modifier_value` 内部那一项相加，所以不能复用辅助函数，必须自己扫表。
-2. **误以为「三个上限函数返回的全是 0」**。那是我们自己的 `detour_max_hp` **读错了返回位置**，
-   不是游戏返回 0。实机日志证明它们返回真实值（`75000000` / `6023399996` 等）。这与 0.3
-   记的两次 ABI 踩坑是同一类错误的第三次 —— 又一次是「参数/返回槽角色搞错，探针或日志先打脸」。
-
-### 0.1.13 「护盾塌成 0」的根因（三步）与封顶判据
-
-根因与实测证据见 0.0 变化 2。要点复述：加算真值超过 `INT64_MAX/1e5` → 游戏 mul wrap 成负 →
-`GetModifierValue` 的 `if (v < 0) v = 0` 兜底把整项夹成 0 → 上限 = `(base+0) × 倍率` = 0。
-
-封顶判据是「加算读到 0 + 倍率 ≥ 1e7 倍 → 封顶到 `INT64_MAX`」。**这条判据只对值住在加算项的
-目标（护盾/装甲）生效**，船体的加算项正常就是 0，用同一条会误伤，已用 `add_carries_value`
-标志按目标分别开关。实机：只有 `CalcMaxShieldHitPoints` 触发，船体/装甲零误报。
-
-### 0.1.14 新增第 18 个目标 `damage_per_day`
-
-定位踩坑与三条「只影响显示」的证据见 0.0 变化 3。一句话总结判据：伤害 = 总计 × 倍率，
-**不可能为负**，负值或 > 9.2e13 游戏单位必然是 wrap；`*r` 是 sret 返回槽，写它不会碰到别的统计项。
-
-### 0.1.16 新增第 19 个目标 `ship_size_max_hp`（`max_hitpoints` 的**源头**饱和）
-
-**症状**：某个 mod 把 `ship_sizes/*.txt` 的 `max_hitpoints` 设成极大值，游戏转定点时
-**不做饱和**，超过 `INT64_MAX/1e5 = 92233720368547`（92 万亿游戏单位）就 wrap 成负数，
-舰船设计界面的「基础船体」显示成负数/垃圾值。
-
-**为什么已有的 `hull_max` 钩子救不了这个症状（调度者给的判断，实测成立）**：
-`hull_max` 的重算公式第一项就是 `base = *(design + 0x10)` —— 而 `design + 0x10`
-**就是** `NShipDesign::CCalculatedValues` 的首成员（`CBaseDesignImplementation` 构造函数里
-`CCalculatedValues((CCalculatedValues *)(this + 0x10))`，Linux 3865201）。
-该字段已被上面的 wrap 污染成负数，于是游戏与我们**从同一个坏值出发**算出同样的结果：
-
-```
-sat == v   =>   if (sat != v) 永不成立   =>   永远不触发
-```
-
-这是**同向错**：重算的输入已经被污染，再忠实的重算也只是忠实复现错误。
-所以必须修**源头**。
-
-#### 链路（Linux 侧逐段读过，四段全是同一份数据）
-
-| # | 位置 | 内容 |
-|---|---|---|
-| 1 | `CShipSize::ReadMember` L3899286-3899288 | `case 0x2de3: pCVar20 = this + 0x678;` → `CReader::Read(param_10,(long*)pCVar20)` —— token `0x2de3` = `max_hitpoints`，**裸读定点，无饱和** |
-| 2 | `CShipDesignStats::AddFromShipSize` L3871571 | `SShipDesignStat::Add((SShipDesignStat*)this, (long*)(param_10 + 0x678), 4, ...)` —— **直接读该字段**累加进 `CCalculatedValues` |
-| 3 | `SShipDesignStat::Recalculate` L3870832 | `*(long*)this = lVar4 + lVar7;` —— 求和写回，`*(design+0x10)` 就是各来源之和 |
-| 4 | `CBaseDesignImplementation::RecalcSpecialValues` L3865179 | `CShipDesignStats::CalcStats((CShipDesignStats*)(this+0x10), lVar8);` —— 每次设计重建都重算 2/3 |
-
-**→ B（面板显示）不需要独立修**：面板那个「基础船体」就是 `max_hitpoints` 派生出来的，
-修好源头 A 与 B 同时正确。**这也是「单点根因」的答案 —— 确实只有一个点需要修。**
-
-而且它天然覆盖「已存盘旧设计/存档里缓存的坏值」：`CShipSize::PostReadInit` 在
-`TSingleObjectGameDatabase<CShipSizeDatabase,...>::PostReadInit`（循环全表）
-与 `ReadExistingEntry`（重建单个对象）**两条路径**上都会跑，重新读档时坏值会被重新兜住。
-
-#### 定位（两套 dump 对照）
-
-1. **Linux `CShipSize::ReadMember`（3898531）** 体内有两条**独占**字符串
-   `[%s] combat_max_speed has been removed, only max_speed is used now.` /
-   `[%s] combat_rotation_speed has been removed, only rotation_speed is used now.`
-   → 在 Windows dump 里检索该串，**唯一命中 `FUN_140d26c70`**（1303 行）= Windows 的 ReadMember。
-2. **token 与偏移三个全同**（决定性）：
-   Linux `case 0x2de0: this+0x670;  case 0x2de1: this+0x658;  case 0x2de3: this+0x678;`
-   ↔ Windows `0x2de0→param_1+0x670`、`0x2de1→param_1+0x658`、`0x2de3→param_1+0x678`，
-   读的同一个原语 `FUN_141baeaa0(reader, slot)` = Linux 的 `CReader::Read`。
-3. **取 PostReadInit 而不是 ReadMember**：ReadMember 是虚函数（Linux 有
-   `non-virtual thunk`，Windows 经 `FUN_140d30400` 虚表槽 0x18 的 adjustor thunk 进入），
-   没有可直接 patch 的唯一入口。PostReadInit 在整个 CShipSize 读完之后每个 ship size 调一次。
-
-**RVA `0x00D2B6E0` = `FUN_140d2b6e0` = `CShipSize::PostReadInit`**
-（函数体指纹：三条独占报错串 `%s upgrade size %s not found in database.` /
-`use_ai_design_role_from: invalid ship size '%s' in ship size '%s'` /
-`invalid component set "%s" in ship size %s`，以及同形的哈希表查找）。
-
-#### ABI（由两处调用点确证，不是靠函数体猜）
-
-签名 `void FUN_140d2b6e0(longlong *param_1)` —— **单参数**：
-
-```
-L2396756  FUN_140d2b6e0(*(undefined8 *)(*(longlong *)(param_1 + 0x50) + lVar2 * 8));
-L2396823  if (param_5 != '\0') { FUN_140d2b6e0(param_4); }
-```
-
-两处都只传一个指针（DB 数组元素 / 重建后的对象），与 Linux
-`void __thiscall CShipSize::PostReadInit(CShipSize *this)` 同形 → `void fn(void* self)`。
-
-#### ★★ 本轮第 5 次「函数体一样 ≠ ABI 一样」：偏移 0x678 是错的，真值是 0x6b8
-
-**这是本节最值得记的一条。** 第一版直接照抄 Linux 的 `0x678` 写进了 detour。
-活体探针一开，读回来的值全是 **0 或 1** —— 而脚本里 `@corvette_hp = 200`
-（应为存储值 20000000）。**照抄偏移会去改一个 bool。**
-
-原因：Windows 的 `CShipSize` **子对象基址是 +0x40**（`FUN_140d30400` 用
-`(**(code **)(param_4[8] + 0x18))(param_4 + 8, param_2)` 进虚表，thunk 再 +0x38 修正），
-所以 Linux 的 `ship_size + 0x678` 在 Windows 上是 `self + 0x40 + 0x678 = self + 0x6b8`。
-另注：Windows 的 CShipSize 大小 0xee8，Linux 是 0xe88，差 0x60。
-
-**独立于 Linux 的反证方法**（只用本插件**已确证**的 `ship_size_of` 与 `design+0x10`）：
-在 `hull_max` 的重算里，`ship_size_of(design)` 拿到本设计的 CShipSize，
-`base_raw = *(design + 0x10)`（**已确证**的面板基础船体值），
-再在该 CShipSize 的 `0x00..0xe00` 全范围扫「值 == base_raw」的槽位：
-
-```
-DIAG HULLMAP size=0000000404731EA0 base_raw=5000000000 (50000.0000) 命中偏移: 6b8
-```
-
-**只命中 0x6b8 一处**（连续 3 次调用都是它）。旁证：0x678 上只有 0/1（标志位）；
-0x6b8 上的取值分布是 1/100/200/300/400/600/1200/2400… 这种「整游戏单位」的船体量级。
-
-**最终实机验证**（偏移修正后）：读到的真实值
-`100 / 100000 / 0 / 0 / 300 / 450 / 600 / 600 / 900 …`，
-其中 100/300/450/600/900 **全部**能在 `common\ship_sizes\*.txt` 的
-`max_hitpoints` 字面量里找到对应值。
-
-> **教训（与 0.1.3、§2 同类）**：Linux dump 里的结构偏移**在任何情况下都不能直接用**。
-> 手册 6.4 明写这条。本轮已经用 ReadMember 的 token 映射把偏移「核对过」了 ——
-> **但核对的两个量本身就在不同的基址上**，所以「逐字对上」并不等于「同一个地址」。
-> 要证明偏移，必须有一个**不依赖 Linux** 的判据。
-
-#### 判据
-
-船体基础值**不可能为负** —— 脚本里是正数，负值只可能来自定点 wrap。
-所以判据是「`self + 0x6b8` < 0 → 封顶到 `INT64_MAX`」，与现有护盾/伤害的封顶值一致。
-**只改负值**，正常正数一律不动，误改风险为零。
-性能：每个 ship size 调一次（实测一局 737 次，含 22 个 mod），不是热路径。
-
-#### 实机验证（两轮）
-
-**第一轮（2026-10-12，用户 playset 22 个 mod）** —— 只证明「装上了、在跑、不误伤」：
-
-```
-hooked ship_size_max_hp @ 00007FF74E22B6E0（…，策略 0）
-共装上 19/19 个钩子（跳过 0）  [REPLACE 已开]
-首次调用: CShipSize::PostReadInit
-      CShipSize::PostReadInit              737
-```
-
-**本局没抓到 EVENT** —— 那套 playset 里最大的 `max_hitpoints` 只有 `5e8`，
-离溢出阈值 `9.22e13` 差 5 个数量级。所以第一轮**只有「没误伤」的证据**。
-
-**第二轮（2026-10-12，专门造的溢出测试 mod）** —— 补齐「溢出时修对了」：
-
-按 `INT64_MAX/1e5 = 92233720368547.75807` 反推：脚本值写成 `1e14`（游戏单位）
-则定点真值 `1e19 > INT64_MAX(9.22e18)`，必然 wrap 一次。用 `stl mod new` 造测试 mod，
-**整块复制**原版 `corvette` 只改 `max_hitpoints` 一处（Paradox 里同名条目是**整体替换**，
-只写一个字段会把 `entity`/`section_slots` 丢掉，船会变砖），建独立 playset 验证。
-
-对照实验（同一存档、同一个 mod，唯一变量是插件开关）：
-
-| | 设计界面「船体值」 |
+| 文件 / 目录 | 作用 |
 | --- | --- |
-| `stl launch --no-plugins`（无插件） | **`-84467440737095.51`** ← 原始症状 |
-| 带 satfix（回写模式） | **`92233720368547.75`** |
-
-差一个 2^64。预测值与实机读数：
-
-```
-预期 wrap 值 = 1e14 × 1e5 − 2^64 = -8446744073709551616
-EVENT CShipSize::PostReadInit max_hitpoints 溢出 max_hitpoints=-8446744073709551616
-      (-84467440737095.5156) -> 封顶到 9223372036854775807 (92233720368547.7656) [已回写]
-```
-
-**逐位相同** —— 说明①偏移读对了（读错槽位不可能凑出这个数）②封顶值正确
-③写回真的生效（界面上看得见）。
-
-第二轮同时**独立复现了 HULLMAP 探针**（第一轮的 `base_raw=5000000000` 那次已被后续运行覆盖）：
-
-```
-DIAG HULLMAP size=00000001BB949070 base_raw=1000000000 (10000.0000) 命中偏移: 6b8
-```
-
-并留下 20 条 `DIAG CShipSize::PostReadInit ... +0x6b8 max_hitpoints=<N>`，
-值域 `30/45/60/90/120/180/270/360/3000…`（游戏单位）—— 全是整数量级的船体值。
-
-> 探针与测试 mod 都是**一次性**的：`diag_recompute_calls` 已还原为 `0`，
-> 测试 mod、测试 playset 均已删除，用户 playset 未受影响。
-
-### 0.1.15 性能修复（用户反馈「过一天变慢」）
-
-两处开销与快/慢路径实测数字见 0.0 变化 4。补一条纪律：`fast_read` **只用于地址来自游戏
-自己传入指针**的场合；任何来自我们解析的 RVA / 猜测的偏移，仍然必须走 `safe_read`。
-
-### 0.1.1 `apply_mul_cfx` 的身份：四重交叉验证
-
-函数体指纹分不出来（75/65 个同形状候选），所以换成靠调用者定位：
-
-1. Linux 侧有 78 个函数调用 `ApplyModifierMult`，其中 35 个带字符串字面量；
-2. 取 `CalcStarbaseCapacity`（其 `STARBASE_CAPACITY_MAX_REACHED` 唯一命中 Windows dump 的 `FUN_14073c540`），发现它两次调用 `FUN_14036df80`；
-3. `FUN_14036df80` 体内正是 `*(DAT_142814390 + 0xa0 + type*0xb0)` 的类型表查找 + `(v*m)/100000` + 拆分回退，与 Linux 962696 逐行对应；
-4. 交叉验证：把 `FUN_14036df80` 的 41 个调用者按字符串认出 Linux 同名函数后，函数名与调用次数同时吻合：
-
-   | Windows 调用者 | 识别依据（字符串） | 次数 | Linux 对应 | Linux 次数 |
-   |---|---|---|---|---|
-   | `FUN_14073c540` | `STARBASE_CAPACITY_BASE`… | 2 | `CalcStarbaseCapacity` | 2 ✓ |
-   | `FUN_14072e570` | `HOSTILE_CLAIMS_PROTECTION`… | 2 | `CalcClaimInfluenceCost` | 2 ✓ |
-   | `FUN_140a42ca0` | `FEDERATION_ENVOYS`… | 1 | `BuildEnvoysTooltip` | 1 ✓ |
-   | `FUN_14071fc60` | `EMPIRE_SIZE_FROM_DISTRICTS`… | 6 | `CalcEmpireSize` | 8 |
-
-   四个独立调用者在名字与调用次数两维同时对上，这是证明，不是推测。
-
-`apply_mul_fp15`（`0x36E0A0`）与前者地址相邻，把 fp15 换算内联了，所以按调用
-`FUN_141b4c0a0` 搜是空的，我一开始就搜空了。公式
-`((x%1e5)*0x40000000/0xc3500000 + (x/1e5)*0x8000) * *param_2 >> 0xf` 与 Linux 962872 一致。
-
-两者都能做成真正的 EXACT。它们返回实际生效的倍率，所以影子复算不需要重新实现
-`CModifier` 的类型表查找：`v0` 读入参、`m_eff` 取返回值、`cfx::mul(v0, m_eff)` 算精确值
-再比对即可。这条路绕开了逆清 `CModifier` 内部结构这个难题。
-
-### 0.2 EXACT 检出链的真机证据（读档不是必要条件）
-
-`cfx_get_rounded` 的判定平时只有读档进局才会被走到，但它是纯函数（读一个 int64、返回一个
-int64、不碰游戏状态），所以插件在 `SATFIX_WIN_FORCE=1` 时用极值直接把真函数调一遍，
-也就是活体探针。链路是 `detour → 蹦床 → 真实的游戏函数 → 判定 → EVENT`：
-
-```
-探针 GetRounded in=123456              -> game=1
-探针 GetRounded in=9223372036854725807 -> game=92233720368547     ← 上界最后一个安全值
-EVENT GetRounded x=9223372036854725808 game=-92233720368547 sat=92233720368547
-探针 GetRounded in=9223372036854725808 -> game=-92233720368547    ← 第一个坏值
-EVENT GetRounded x=9223372036854775807 game=-92233720368547 sat=92233720368547
-探针 GetRounded in=-9223372036854775808 game=92233720368547 sat=-92233720368547
-```
-
-同时证明了三件事：游戏真的会算错（用的是它的机器码，不是我自己的模型）、蹦床链没坏、
-判定与饱和值正确。
-
-### 0.3 两次 ABI 踩坑
-
-1. 同形状不等于同 ABI。`0x75A370` 与 `0x1B4C0A0` 函数体公式完全一样，但调用点
-   （`FUN_14075a370(&local_res20, 1000)`，第二个参数是缩放标量）说明前者是带缩放参数的
-   另一种换算，不是 `operator fpml<...,15>`。我最早把 `0x75A370` 当目标，活体探针四个输入
-   返回同一个常数 `1767657313`，因为我的 `&x` 被当成了缩放值。
-2. 机器码要看参数顺序，不能只看寄存器角色。即使把 `0x1B4C0A0` 认对了，我还是把
-   `(ret, src)` 写成了 `(src, ret)`，探针就恒返回 0（它读 `*(&slot)`=0 当源）。直到解码
-   前 6 字节（`4c 8b 01`=`mov r8,[rcx]`、`4c 8b d2`=`mov r10,rdx`）才定下 `rcx=源, rdx=返回槽`，
-   即 C++ 参数顺序是 `(src, ret)`。
-
-两次都是活体探针先打脸、再修好的。没有它，第 1 个错误要等到开 REPLACE 才会以写坏内存的
-形式暴露。
-
-### 0.3.1 第三次 ABI 踩坑：`GetRounded(fp15)` 少传一个参（2026-11-06）
-
-> **后续更正（0.4.2）**：这一节记录的是**真实存在**的 ABI 错误（探针能复现垃圾值，
-> 已修），但事后证明它**不是 CTD 的原因**。真正机制是 LTCG 的寄存器保全契约，
-> 见 §0.3.2 —— 只修这条 ABI 并不能阻止崩溃（0.4.1 发布后普通国家仍会崩）。
-
-这是本项目第一次由「少传参数」而不是「参数顺序反了」造成的 ABI 错误。完整链路：
-
-1. **现场**：反馈者用游牧国家（Nomads DLC）研究科技时直接闪退。报错日志最后一条是
-   `nomads.1150` 选完选项；本地用 `humans3`（游牧开局）复现，游戏进程消失。
-   崩溃转储 `crashes/stellaris_2026.../exception.txt`：
-   `Unhandled Exception C0000005 at 0x00000000007FEE68` —— 故障地址是**栈地址**，
-   即控制流跳到了栈上（多半是垃圾值被当作指针/函数指针继续使用）。
-2. **相关性**：崩溃前 `satfix.log` 最后两条恰好是
-   `首次调用: GetRounded(fp15)` / `首次调用: GetRounded/GetRounded64`。
-3. **根因**：反编译 `FUN_141b4c100` 是 **sret 两参**：
-   `uVar1 = *param_2; *param_1 = ...; return param_1` —— `rcx = 输出槽`、`rdx = 输入`。
-   0.4.0 的 detour 却按「单参、输入在 rcx」写，调用蹦床时只转发 rcx；
-   而 detour 自己的 `note_first_call()`（写日志）会把 rdx 改掉，
-   于是**第一次调用**原函数从垃圾指针读 8 字节，算出一个垃圾值。
-4. **为什么正好是「研究科技」**：`FUN_141b4c100` 的调用者 `FUN_140426d90` 里引用了
-   `TECH_COST_EMPIRE_SIZE` / `TECH_COST_OVERLORD` 两个字符串 —— 这就是**科技成本计算**。
-   游牧国家的科技成本首次计算时命中这条路径，垃圾成本被后续逻辑继续使用 → 崩。
-5. **修复**：
-   - detour 改成 `(long long* out, const long long* src)` 并**原样转发两个参数**；
-   - 这个 OBSERVE 钩子改成**先调原函数、再记账** —— 记账（`logf`/原子计数）可能改写
-     参数寄存器，先调用就不会让它们污染原函数的输入；
-   - 顺手给上限重算的虚调用 `ship_size_of(design)` 加了一道 vtable 合法性闸
-     （`design` 首字段必须指向本镜像，否则跳过重算）—— 数据库加载期游戏会传栈上的
-     假指针，假 vtable 的 `+0x10` 同样是「跳到垃圾地址」的形态。
-6. **证据（可复现的 A/B）**：
-   - 活体探针（`SATFIX_WIN_FORCE=1`），**旧 0.4.0 DLL**：
-     `bits=0x0 -> 679080784`、`bits=0x0 -> 679080784`、`bits=0x0 -> 679080784`
-     —— 三个不同输入返回同一个常数，且输入的 `bits` 被写坏（典型 ABI 错）。
-   - 同一探针，**修复后**：`0 -> 0`、`0x8000 -> 100000`、`-0x8000 -> -100000`
-     （fp15 的 1.0 = 0x8000 = 100000 游戏单位，逐值正确）。
-   - 实机：修复后游牧局 `humans3` 连跑 3 局到 2220 年，每局 `GetRounded(fp15)`
-     实调 20 万次量级、0 崩溃；旧 DLL 在同一流程里第一局就复现了 CTD。
-
-> 教训：**「函数体一样」还不够，参数的个数也是 ABI 的一部分。** 只看寄存器角色
-> （`rdx` 是源）而没数参数个数（`rcx` 也得转发），就会写出「少传一个参数」的 detour；
-> 这种 detour 在大多数调用点能工作，只在**自己改写寄存器**的那次（首次记日志）爆炸 ——
-> 所以它表现为偶发 CTD，而不是每次都崩。
-
-### 0.3.2 真正的根因：MSVC LTCG 的「寄存器保全契约」（2026-11-06，v0.4.2）
-
-0.4.1 发布后，反馈者又报：**游牧不崩了，普通国家（地球联合国）崩**。
-新的崩溃包 `crashes/stellaris_20261106_234742`：`c0000005`，
-`ExceptionInformation = [0x8, 0x7FF078]` —— `0x8` 表示 **DEP 执行违规**，
-即又一次「跳到栈上执行」。
-
-**指令级证据**（崩溃线程栈里的返回地址 `RVA 0xFC5BD2`，反汇编它前面的代码）：
-
-```asm
-0xFC5BC1  lea  rcx, [rbp+0x78]
-0xFC5BC5  call 0x141B50CE0      ; CFixedPoint::GetRounded —— 我们钩了它
-0xFC5BCA  mov  edx, eax
-0xFC5BCC  mov  rcx, r10         ; ← 调用之后继续用 r10
-0xFC5BCF  call r11              ; ← 调用之后继续用 r11
-0xFC5BD2  nop                   ; 栈里的返回地址就是这里
-```
-
-`GetRounded` 的函数体只碰 `rax/rcx/rdx`（反编译可证），所以游戏编译器
-（MSVC `/GL`，LTCG 全程序优化）**知道**它不破坏 `r10/r11`，于是把这两个值
-跨调用保留、并在调用后继续使用。标准 ABI 里 `r10/r11` 是 caller-saved，
-但 LTCG 用「实际破坏集」而不是「ABI 上限」来做寄存器分配 —— 这是 ABI 之外
-的第二层契约。
-
-我们的 C detour 会随意改写 `r10/r11`（尤其首次调用写日志、心跳时），
-于是 `mov rcx, r10` 拿到垃圾、`call r11` 直接跳到栈地址 → **DEP 崩溃**。
-这同时解释了：
-
-* 为什么崩溃总发生在「首次调用」附近（首次调用会走 `logf`，破坏面最大）；
-* 为什么 0.4.1 只修 `GetRounded(fp15)` 的 ABI 不够 —— **每个**钩子都有这个问题，
-  只是哪次调用、哪个调用点先踩中而已；
-* 为什么普通国家也会崩：科技成本计算同样走 `GetRounded`，与游牧无关。
-
-#### 修法：汇编转发桩（`src/detour_stubs.asm`）
-
-19 个钩子全部改为安装一个极小的汇编桩，而不是直接装 C 函数：
-
-```
-push rbp / push rcx,rdx,r8,r9,r10,r11 / sub rsp,0A0h
-movaps [rsp+30h..80h], xmm0..xmm5        ; 保存所有易失寄存器
-[rsp+20h] = [rbp+30h]                    ; 转发第 5 个参数
-[rsp+28h] = [rbp+38h]                    ; 转发第 6 个参数
-call detour_xxx                          ; 原来的 C 函数体（逻辑不变）
-movaps xmm0..xmm5, [rsp+30h..80h]        ; 恢复
-pop r11..rcx / pop rbp / ret             ; rax 保持 C 函数体的返回值
-```
-
-桩对寄存器的破坏集 = **空集**（比原函数更保守），所以任何依赖
-「原函数不破坏某寄存器」的调用点都不会被我们破坏。`build.ps1` 里用
-`ml64` 单独汇编（`cl` 不会自动分派 `.asm`），再把 `.obj` 链进 DLL。
-
-**验证**：
-
-* 桩的机器码逐条核对（`dumpbin /disasm build\detour_stubs.obj`），保存/恢复/参数转发/对齐全部符合预期；
-* 实机：`humans1_1`（地球联合国）3 局 + `humans3`（游牧）1 局，各跑 30 年，
-  全部跑完；单局钩子调用 **9950 万次**（`GetRounded` 625 万、`Atan2` 5100 万、
-  `ApplyModifierMult` 3125 万），0 崩溃、`crashes/` 无新目录。
-* 修复前同一台机器上普通国家一局内即崩（崩溃包 `stellaris_20261106_234742`）。
-
-> 教训：**钩子要遵守调用约定，不只是参数个数/顺序 —— 还包括「破坏集不能比原函数大」。**
-> 在 LTCG 编译的程序里，调用方会依赖原函数实际保留的 volatile 寄存器。
-> 只要钩子体里有任何函数调用/日志，就一定会破坏它们；唯一稳妥的做法是
-> 在钩子入口保存全部 volatile 寄存器并在返回前恢复。
-
-
-### 0.5 `REPLACE=1` 回写路径的实机证据
-
-用 `.\build.ps1 -Replace` 重新编译后再跑同一组探针，对比影子/回写两种模式：
-
-| 输入 | 影子模式（游戏值） | REPLACE 模式 | 说明 |
-|---|---|---|---|
-| `123456` | `1` | `1` | 不越界 → **不改**（只有真分歧才回写） |
-| `INT64_MAX` | `-92233720368547`（buggy） | **`92233720368547`** | 回写成正确值 |
-| `9223372036854725808` | `-92233720368547` | **`92233720368547`** | 上界第一个坏值 |
-| `INT64_MIN` | `+92233720368547` | **`-92233720368547`** | 下界 |
-
-这条证据说明回写逻辑的两个要害都对了：只在真分歧时动手，而且写进去的是正确的饱和值，
-而不是把游戏值原样写回。
-
-不带参数跑 `build.ps1` 编出来的仍然是影子模式，回写要显式开。
-
-### 0.6 还没做完的部分
-
-本节是 0.1 之前的遗留清单，留在这里存档。0.1/0.1.1 到 0.1.15 里已经解决的项没有从下面删掉，
-以那几节为准。下面每条后面括注了**当前的结论**，方便对照。
-
-* **`apply_mul_cfx` / `apply_mul_fp15` 身份未证实**（**已解决**，0.1.1：靠调用者法定为
-  `0x36DF80` / `0x36E0A0`，候选 `0x3E6AA0` 是错的）。首选候选是
-  `FUN_1403e6aa0 @ 0x3E6AA0`：80 行、82 个调用点（Linux 版 81 行），体内有裸乘
-  `(v*m)/100000` + `0xb504f333/0x16a09e667` 双输入安全域 + 拆分回退，与 Linux 版同源。
-  但不敢装：这个 dump 里有 75 个函数含同一套 CModifier 惯用法（含大量内联副本），
-  常量指纹无法唯一区分；而且它会就地改写状态（对 `param_1+0x38` 的 0x10 步长数组累加），
-  不能用活体探针那种不改状态就能验证 ABI 的办法。要确证它得去 Ghidra 里看调用点的类型。
-* **`cfx_sqrt` / `cfx_safe_sqrt*` 未定位**（**已解决**，0.1.6：靠调用者法定为 `0x1B489D0` /
-  `0x1B4C600`；`cfx_safe_sqrt_int` 经 0.1.11 判定 Windows 侧**不存在**，非缺口）。
-  `0xb504f334` 经查不是 Sqrt 独有常量（它出现在
-  若干 CModifier 惯用法里，原先的推断是错的），目前没有可靠指纹，需要专门做。
-* **`var_add` 未定位**（**已解决**，0.1.2：`0x177800`，靠 4 个 helper 的调用组合定位）。
-  已确证的 `var_multiply` 在 RVA `0x1777F00`（**注意：不是 `0x231640`**，那个是错的，见 0.1.3），
-  但它周围 0x230500–0x231800 全是无关小函数，`CAddVariableEffect` 不在这里；Linux dump 里也没有该
-  符号（149 个 ExecuteActual 里无法用常量区分加法/乘法版本）。
-* **4 个 helper 暂不做**（**已做**，现在是 6 个 helper、签名校验 `6/6`）：
-  `AccessVariablePointer` `0x9F7DF0` / `cvars_get` `0x227390` / `cvars_set` `0x7AAE10` /
-  `cfp_getvalue` `0x34D500`（变量系统用），外加上限重算链的
-  `ship_size_of` `0x30E990` / `modifier_value` `0xD29DD0`。
-  注意：变量系统那两个 helper 虽然打通了读回链，但 `var_add`/`var_multiply` **仍是 OBSERVE**
-  （见 0.1.4 的更正），所以它们目前是「已解析、未用于回写」。
-* **`mpe15`/`mpe7`/`diplo_weight`/`shield_max`/`armor_max`/`hull_max`**：全 OBSERVE
-  （**已解决定位**，0.1.2 / 0.1.8 / 0.1.10）。其中三个上限函数**已升级为 EXACT**（0.1.12）；
-  `mpe15`/`mpe7`/`diplo_weight` 仍是 OBSERVE。
-* **正常游玩几乎不会产生 EVENT**：原版量级离阈值极远（`GetRounded` 要 `x > 9.2e17`），
-  所以正常游玩时 0 条 EVENT 应读作预期结果。要验证检出链请用活体探针（第 4 节）。
-  （这一轮不一样：`CalcMaxShieldHitPoints` 与 `CalcAverageDamagePerDay` 在用户的极端存档上
-  抓到了真实 EVENT，见 0.0。）
-* `REPLACE=1` 只编译过，回写路径尚未实机跑过（**已解决**，0.5 + 0.1.11 的 A/B 证明）。
+| `src/sat_guard_win.cpp` | 插件本体：`DllMain`、日志系统、配置热重载、主线程泵、19 个 detour、活体探针 |
+| `src/detour_stubs.asm` | 19 个钩子的 MASM64 寄存器保全转发桩（应对 MSVC `/GL` LTCG 破坏集契约） |
+| `src/satfix_targets_win.generated.hpp` | **自动生成，勿手改**；包含当前构建的 PE 时间戳、19+6 组 RVA 与 16 字节序言签名 |
+| `winhook.hpp` | Windows x64 hook 引擎（5 字节 `E9 rel32` → relay → 蹦床，含 rel8→rel32 加宽与线程挂起原子补丁） |
+| `satfix128.hpp` | 128 位中间量算术（基于 `<intrin.h>` 的 `_umul128`/`_mul128`/`_udiv128` + 自写长除，替代 GCC `__int128`） |
+| `stl_fix_win.hpp` | 定点饱和参考实现（`CFixedPoint` 十进制与 `fpml` 二进制方言，无外部依赖） |
+| `satfix_decision.hpp` | 独立于 hook 机制的纯判定函数 + 14 组进程内自检向量表 |
+| `plugin/` | 开发联调目录：`stl-plugin.json`、`defaults/satfix.ini`（以及构建复制过来的 `satfix.dll`） |
+| `test/` | 3 套原生离线自测：`test_winhook.cpp`、`test_stl_fix_win.cpp`、`test_load_plugin.cpp` |
+| `tools/` | `gen_targets_win.py`、`check_plugin_pkg.py`、`package_release.ps1`、dump 索引与指纹工具 |
+| `tools/relocate/` | 游戏更新后的跨版本重定位工具链（见 [`tools/relocate/README.md`](tools/relocate/README.md)） |
+| `build.ps1` | 一键脚本：汇编 + 编译 + 3 套原生自测 + 组装 `dist\satfix\` + 合规检查 |
+| `RELEASE_NOTES.md` | 发布说明唯一来源（被 `tools/package_release.ps1` 按 `## v<version>` 解析） |
 
 ---
 
-## 1. Windows 侧为什么不能照抄 Linux 的定位方式
+## 2. 架构设计
 
-Linux 版靠符号名定位：
+### 2.1 `winhook.hpp` —— Hook 引擎
 
-```
-nm stellaris → mangled 名 → 地址 → 运行时 dlsym / 读 /proc/self/exe 的符号表
-```
+继承自 Linux 侧 `hooklib/shk.hpp` 的 5 字节入口补丁与指令重定位算法，适配 Windows 平台并修复了原实现的两项缺陷：
 
-Windows 的 `stellaris.exe` 实测（`pefile`）：
+- **两跳结构**：在目标函数 ±1.75 GB 范围内用 `VirtualQuery` + `VirtualAlloc` 申请临近页放置 `relay`（`FF 25 00000000 <detour64>`）与蹦床，原函数入口仅改写 5 字节 `E9 rel32 -> relay`，不触碰任何寄存器。
+- **rel8 → rel32 加宽**：蹦床拷贝序言时自动将短条件跳（`0x70..0x7F`）加宽为 `0F 8x rel32`，短无条件跳（`0xEB`）加宽为 `E9 rel32`，并重算所有 RIP 相对与分支位移。
+- **线程挂起式热补丁**：写 5 字节补丁期间挂起同进程其余线程并调用 `FlushInstructionCache`，避免并发执行踩到半截指令。
+- **双档安全内存读取**：
+  - `whk::safe_read`：`VirtualQuery` 可读性预检 + 独立 `seh_memcpy`（避免 MSVC C2712），用于 RVA、全局指针、vtable 验证与不确定指针；
+  - `whk::fast_read`：仅 SEH 兜底、不进内核态，用于高频热路径上来自游戏的可信对象指针。
+- **可恢复注册表**：统一 `HookRegistry` 单例管理已安装地址，失败回滚与卸载重装均能正确清理槽位。
 
-| 项 | 值 | 后果 |
-| --- | --- | --- |
-| 导入表导出的符号 | 110 个 | `GetProcAddress` 拿不到任何游戏函数 |
-| C++ 符号 | 无 | 没有 mangled 名可用 |
-| PDB | 无（游戏目录里只有 `dbghelp.dll`） | 不能从符号服务器拿 |
-| `.pdata` | 134803 个函数 | 只有地址区间，没有名字 |
-| RTTI | 1269 条类名 | 只能给类，给不了非虚成员的地址 |
+### 2.2 `detour_stubs.asm` —— LTCG 寄存器保全桩
 
-所以改成硬编码 RVA + 序言字节签名双重校验。RVA 由静态分析确证（见第 3 节）；运行时先按
-RVA 读前 16 字节，与签名逐字节比对；不匹配（游戏更新过，或注入到了别的程序）就跳过该
-目标并写日志，绝不盲目读写内存（手册 6.4、7 节的要求）。
+`stellaris.exe` 使用 MSVC `/GL`（LTCG）编译。编译器会跨函数传播被调函数的**实际寄存器破坏集**，使调用方把活跃值放在标准 ABI 定义为 caller-saved 的寄存器（例如 `r10`/`r11`）里跨调用保留。如果普通 C detour 改写了这些寄存器（尤其在首次写日志或心跳时），调用方后续 `call r11` 就会直接跳到栈地址触发 `c0000005`（DEP 执行违规）。
 
-`tools/gen_targets_win.py --check` 把这份校验提前到构建期。
+因此全部 19 个钩子一律通过 `detour_stubs.asm` 中的转发桩安装：
+1. 入口保存全部易失寄存器（`rcx/rdx/r8-r11`、`xmm0-5`），维持 16 字节栈对齐；
+2. 转发第 5、6 个栈参数；
+3. 调用对应的 C `detour_*` 函数体，暂存 `rax` 返回值；
+4. 原样恢复所有保存的寄存器并返回。
 
-### 1.1 映射里的函数名不是身份证明
+这使得钩子对游戏调用点的寄存器破坏集恒为**空集**，比原函数更保守。
 
-`_analysis/win_linux_mapping_final_452.json` 里有 10186 对 `FUN_ → Linux 名`，看着很诱人，
-但它是字符串字面量指纹匹配出来的。`confidence: "exact"` 的意思只是这个字符串指纹唯一
-命中，不代表这个函数就是同名的 Linux 函数。
+### 2.3 线程模型与主线程泵
 
-实测的两个反例，直接读函数体就能看出来：
+严格遵循插件手册 §6.1 与 §6.3：
+- **`DllMain`**：只调用 `DisableThreadLibraryCalls` + `CreateThread`，不等待、不加载 DLL、不碰引擎或文件。
+- **后台初始化/监听线程**：完成构建校验、安装钩子后，每 2 秒检查一次 `config\satfix.ini` 的修改时间并置位原子标志 `g_reload_requested`，绝不碰游戏对象或引擎函数。
+- **主线程泵**：配置重读、统计汇总等重活推迟到游戏线程下一次进入被 hook 函数时执行；多线程日志通过 `SRWLOCK` + 整行单次缓冲 `fputs` 保证不交错断行。
 
-| 映射说 | 实际是 |
-| --- | --- |
-| `FUN_1408b3700` = `ApplyModifierMult` | modifier token 分发器（把 `param_3` 与 `0x2a7b/0xb5/0x31a` 比较） |
-| `FUN_1408b3e00` = `ApplyModifierMult` | 析构函数（写回 vtable、释放内存） |
+### 2.4 双重版本校验
 
-所以本表只采信函数体形状，逐条证据写在目标表的 `evidence` 字段里。
-
----
-
-## 2. 架构
-
-### 2.1 `winhook.hpp` — hook 引擎
-
-算法与 `hooklib/shk.hpp` 逐条保留，只换 OS 那一层：
-
-| Linux (shk) | Windows (whk) |
-| --- | --- |
-| `/proc/self/exe` + ELF `.symtab` | 没有符号，改用 RVA 表 + 序言签名 |
-| `mprotect(RWX)` | `VirtualProtect`（并保存/恢复原保护） |
-| `mmap(MAP_FIXED_NOREPLACE)` | `VirtualQuery` 找空洞 + `VirtualAlloc` |
-| `munmap` | `VirtualFree` |
-| `__builtin___clear_cache` | `FlushInstructionCache` |
-| （无） | `SuspendThread` 其余线程，让 5 字节补丁原子化 |
-
-解码器可以直接照搬：指令长度编码由 x86-64 架构决定，与操作系统无关。shk 对真实
-`stellaris` 的 139452 个函数做过前 12 字节必须能完整解码的全量扫描，失败 0 个。
-Windows 上真正的差异在函数序言形状（MSVC vs GCC），所以 whk 不假定一致，而是用序言签名
-在安装前显式检查。
-
-补掉的两个 shk 缺陷：
-
-* `mark_hooked` / `unmark_hooked` 原来各自声明函数局部 `static`，两张表互不相通；而且
-  `unmark` 是空操作，安装失败也会把地址永久占住。现在共用一个 `HookRegistry` 单例，
-  `remove()` 真的删（尾部元素填补空洞），所以失败后重试和卸载后重装都能用，自测第 7 节
-  专门验证这条。
-* MSVC 禁止在需要对象展开的函数里用 `__try`（C2712），而 `InlineHook` 有 `std::vector`
-  成员，所以 SEH 的 `memcpy` 被抽成独立的 `seh_memcpy`。
-
-### 2.2 `satfix128.hpp` — 128 位中间量
-
-饱和判定必须在 128 位上做，游戏溢出正是因为中间乘积只用 64 位。
-
-不用 `std::_Signed128`：它虽然实测可用，但那是 MSVC 的未文档化内部头，随工具链更新
-可能改形状。这里只依赖 `<intrin.h>` 里四个有文档的内建：`_umul128` / `_mul128` / `_udiv128`
-（外加自己写的长除）。
-
-关键点：`_udiv128(hi, lo, d, &r)` 在 `hi >= d` 时会触发 #DE（除零错），而我们的商经常超过
-64 位（例如 `2^126 / 100000`），所以 `udiv128by64` 自己长除，先算商的高 64 位，把余数接到
-低位再除一次，保证每次调用 `_udiv128` 时其 high 参数都严格小于 d。
-
-`mul_shift_sat` 里 `a * b` 可能超过 2^127，所以先取幅值、算术右移之后再取负，避免把中间值
-搬进有符号 128 位。
-
-### 2.3 线程模型（手册 6.3，最容易让游戏静默崩的地方）
-
-被 hook 的函数本身运行在游戏主线程，所以 detour 里读参数、算影子、写回值是安全的。
-detour 只做纯算术加原子计数，重活（日志格式化、配置重读、统计汇总）排到 `g_tasks`，由
-主线程泵在下一次游戏主线程进入任一被 hook 函数时执行。
-
-这样既不必 hook `Present`/DXGI，也不会从别的线程碰引擎状态。
-
-自己那个线程只做等待与 `GetFileAttributesExW`（手册 6.3 允许的事），在 `DllMain` 里创建
-（手册 6.1：`DllMain` 只 `CreateThread`，不等待/不加载库/不做 IO）。
+Windows 版 `stellaris.exe` 无 PDB 且不导出 C++ 游戏符号，因此采用两层防护：
+1. **启动器层**：`plugin/stl-plugin.json` 的 `game.exe_timestamps` 声明适配构建；
+2. **DLL 运行时层**：启动时校验主模块 PE `TimeDateStamp` 是否等于 `SATFIX_WIN_EXE_TIMESTAMP`，随后逐目标比对 16 字节序言签名；任一项不匹配即安全停用并记日志，绝不盲目打补丁。
 
 ---
 
-## 3. 已确证的目标清单（按片区）
+## 3. 目标清单（Cygnus v4.6.0 / `0x6AF6BDEC`）
 
-**当前共 19 个目标**（EXACT 9 / INPUT_GUARD 1 / OBSERVE 9）+ 6 个辅助函数，未定位 1 个；
-完整清单与策略见第 0 节与 `src/satfix_targets_win.generated.hpp`。
-本节按片区展开**定位证据**，逐个列的是 CFixedPoint 族与变量系统那几个（它们的证据最完整、
-踩坑最多）；`shield_max`/`armor_max`/`hull_max`、`damage_per_day` 与
-`ship_size_max_hp` 的证据见 0.0 与 0.1.12 ~ 0.1.16。
+策略分布以 `src/satfix_targets_win.generated.hpp` 为权威：**EXACT 9 / INPUT_GUARD 1 / OBSERVE 9**（合计 19），另有 **6 个辅助函数**。
 
-比对基准是 Linux 反编译 `stellaris_4.5.2_source.cpp`；两侧 build hash 逐字节相同
-（`32709cf254181b032b1b309a6ea09776`）。复核命令：
+### 3.1 19 个 Hook 目标
+
+| Key | 目标函数 | 4.6.0 RVA | 策略 | 当前行为与说明 |
+| --- | --- | :---: | :---: | --- |
+| `cfx_get_rounded` | `CFixedPoint::GetRounded() / GetRounded64()` | `0x01CFF460` | EXACT | MSVC COMDAT 折叠共用同一地址；修 `x±50000` 溢出（`INT64_MAX` 原版返负值） |
+| `cfx_to_fp15` | `CFixedPoint::operator fpml<...,15>() const` | `0x01CFF360` | EXACT | ABI `(src=rcx, ret=rdx)`；理论上不会溢出，保留作证明与探针 |
+| `apply_mul_cfx` | `CModifier::ApplyModifierMult(CFixedPoint&, ...)` | `0x004025F0` | EXACT | 修正乘法主出口；复用返回值（实际倍率）做 128 位饱和复算 |
+| `apply_mul_fp15` | `CModifier::ApplyModifierMult(fpml<...,15>&, ...)` | `0x00402730` | EXACT | 同上，乘法在 2^15 编码上执行 |
+| `shield_max` | `NShipUtil::CalcMaxShieldHitPoints` | `0x00BB52E0` | EXACT | 忠实重算 + 「加算溢出塌成 0」封顶到 `INT64_MAX` |
+| `armor_max` | `NShipUtil::CalcMaxArmorHitPoints` | `0x00BB5CD0` | EXACT | 同上，忠实重算 + 塌 0 / 负值封顶 |
+| `hull_max` | `NShipUtil::CalcMaxHitPoints` | `0x00BB4A60` | EXACT | 近似重算（未建模三段条件加法，方向安全）+ 负值封顶 |
+| `damage_per_day` | `NShipUtil::CalcAverageDamagePerDay` | `0x00BB7D70` | EXACT | 舰船详情面板「伤害」负值/越界封顶（**仅影响 UI 显示，不影响实战伤害**） |
+| `ship_size_max_hp` | `CShipSize::PostReadInit()` | `0x00E42660` | EXACT\* | `max_hitpoints` 源头负值兜底；**⚠️ 4.6.0 暂以 `kShipSizeWriteEnabled=false` 仅观测不回写，待活体复核 `+0x6b8`** |
+| `cfx_sqrt` | `CFixedPoint::Sqrt() const` | `0x01CFBC90` | INPUT_GUARD | 负输入在原实现会被当作极大无符号数迭代；检测并夹取 |
+| `cfx_safe_sqrt` | `CFixedPoint::SafeSqrt() const` | `0x01CFF8F0` | OBSERVE | 记录负输入；ABI `(src=rcx, out=rdx)` |
+| `cfx_round_to` | `CFixedPoint::RoundTo(CFixedPoint const&)` | `0x01CFF4A0` | OBSERVE | 记录 `divisor==0` 与 `v + divisor/2` 溢出 |
+| `cfx_atan2` | `CFixedPoint::Atan2(...)` | `0x01CFF5C0` | OBSERVE | 记录参数平方越界量级 |
+| `cfx_get_rounded_fp15` | `CFixedPoint::GetRounded(fpml<...,15> const&)` | `0x01CFF3C0` | OBSERVE | ABI `(out=rcx, src=rdx)`；4.6.0 起游戏自身已加入饱和钳位 |
+| `var_multiply` | `CMultiplyVariableEffect::ExecuteActual` | `0x018E8E40` | OBSERVE | **⚠️ 4.6.0 改 token 哈希表，`kVarShadowSupported=false`，当前仅计数** |
+| `var_add` | `CAddVariableEffect::ExecuteActual` | `0x018E83D0` | OBSERVE | 同上，当前仅计数 |
+| `diplo_weight` | `CPopJob::CalcDiplomaticWeight` | `0x00916BA0` | OBSERVE | 记录负值或极端越界的外交权重 |
+| `mpe15` | `NCombatRules::CalcMilitaryPowerExponent<15>` | `0x00BAE130` | OBSERVE | 舰队实力指数（fp15），ABI `(out, base, exp)`；记录中间积风险 |
+| `mpe7` | `NCombatRules::CalcMilitaryPowerExponent<7>` | `0x00BAE2A0` | OBSERVE | 舰队实力指数（fp7），同上 |
+
+> **唯一未定位项 `cfx_safe_sqrt_int`（`CFixedPoint::SafeSqrt(long long)`）**：经 4.5.2 反编译核实，Windows 版 `MTTHModifyNumber` 的 `case 0xf` 直接调用引用版 `SafeSqrt(CFixedPoint const&)` 且自带负值判断，MSVC 不生成整数重载及其 `p * 100000` 溢出点，因此**并非功能缺口**。
+
+### 3.2 6 个辅助函数（只解析地址与验签，不装钩子）
+
+| Key | 对应函数 | 4.6.0 RVA | 当前用途 |
+| --- | --- | :---: | --- |
+| `ship_size_of` | 从 `CBaseDesignImplementation` 取当前成长阶段 `CShipSize*` | `0x003AEA80` | **启用**：三上限重算链第一步（调用前先校验 `design` vtable 落在本映像内） |
+| `modifier_value` | `CShipSize::GetModifierValue(CModifier const&, ModifierType)` | `0x00E40D40` | **启用**：三上限重算链取值原语 |
+| `access_var_pointer` | `AccessVariablePointer` | `0x00B00910` | 暂未调用（4.6.0 第二参由 `CString*` 改为 `uint16` token） |
+| `cvars_get` | `CVariables::GetVariable` | `0x00295C10` | 暂未调用（4.6.0 变量效果链已不再走此函数） |
+| `cvars_set` | `CVariables::SetVariable` | `0x0088D260` | 暂未调用（4.6.0 改为 token 键控写回） |
+| `cfp_getvalue` | `CFixedPointVariableValue::GetValue` | `0x003E3CF0` | 暂未调用（随变量影子复算一并停用） |
+
+---
+
+## 4. 核心修复机制与 4.6.0 适配变化
+
+### 4.1 护盾 / 装甲 / 船体上限重算与「塌成 0」修复
+
+重算链完全复用游戏自身原语并改用 128 位饱和算术：
+
+```text
+size   = ship_size_of(design)
+base   = *(design + design_off) + modifier_value(size, mods, type_add) [+ cls_base]
+add    = modifier_value(size, mods, type_mul) + ship_class_mod(design, mods, class_table) [+ cls_mul]
+factor = add + 100000
+sat    = cfx::mul(base, factor)   // 128 位饱和乘法
+```
+
+4.6.0 实证常量与表地址（`src/sat_guard_win.cpp`）：
+
+| 目标 | `design` 偏移 | 加算 / 乘算 type | 条件性船级对 | 舰船等级修正表 RVA（15 项） | `add_carries_value` |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| `hull_max` | `0x10` | `0x20` / `0x21` | — | `0x2A2BCA4` | `false`（值在 `base`） |
+| `armor_max` | `0x70` | `0x26` / `0x27` | `0x1d2` / `0x1d3` | `0x2A2BCE0` | `true`（值在加算项） |
+| `shield_max` | `0x130` | `0x30` / `0x31` | `0x1d4` / `0x1d5` | `0x2A2BD1C` | `true`（值在加算项） |
+
+此外，4.6.0 的 ModifierType 元数据表改为**运行时指针间接寻址**（指针变量 RVA `0x2A29CF0`，静态映像中为 `0`、启动后由引擎填充），插件在内联扫表时已改为 `safe_read` 动态解引用该指针。
+
+**回写闸门与热路径优化**：
+- **早退**：所有回写分支均要求游戏返回值 `v <= 0`；正常舰船 `v > 0` 直接返回，跳过重算与扫表开销。
+- **塌成 0 兜底**（仅 `add_carries_value == true` 的护盾/装甲）：当加算项因溢出先 wrap 成负再被 `GetModifierValue` 掩码夹成 `0`，表现为 `add_in == 0` 且乘算倍率 ≥ `1e7` 倍时，判定塌 0 并封顶回写 `INT64_MAX`。
+- **保守原则**：正常正值哪怕重算不等也绝不改写；回写前先检查 `design` 的 vtable 指针合法性，避免数据库加载期的栈上临时对象导致虚调用崩溃。
+
+### 4.2 面板「伤害」（`damage_per_day`）与船体基础值（`ship_size_max_hp`）
+
+- **`damage_per_day`**：拦截 `NShipUtil::CalcAverageDamagePerDay` 的 sret 返回槽；伤害总计不可能为负，检出负值或越过上限即封顶为 `INT64_MAX`。经调用图核实，全部 8 个调用者均属 UI/工具提示层，只修正界面显示，不影响战斗伤害结算。
+- **`ship_size_max_hp`**：拦截 `CShipSize::PostReadInit()`，在 mod 加载 `ship_sizes/*.txt` 阶段从源头拦截 `max_hitpoints` 的 wrap 负值（否则污染 `design + 0x10` 后下游重算会产生「同向错」）。
+  - ⚠️ **4.6.0 临时状态**：偏移 `0x6b8` 系在 4.5.2 / 4.5.3 上用 HULLMAP 探针实测得出；4.6.0 尚未复核结构布局，源码中 `kShipSizeWriteEnabled = false`，当前只检出记 EVENT 而不写入。复核方式：将 `config\satfix.ini` 的 `diag_recompute_calls` 设为正数，进游戏查看舰船设计/详情，确认日志中 `DIAG HULLMAP ... 命中偏移:` 仍为 `6b8` 后即可重新启用回写。
+
+### 4.3 4.6.0 主动停用变量影子复算
+
+4.6.0 将脚本变量存储改为 token 键控哈希表，`AccessVariablePointer` 第二参由 `CString const*` 变为 `uint16` token，旧的四步读回链会产生非法指针风险。因此源码中 `kVarShadowSupported = false`，`var_multiply` / `var_add` 目前仅做调用计数（即使配置里打开 `verify_variables` 也不会启用）。
+
+---
+
+## 5. 配置与日志
+
+配置文件位于 `<插件目录>\config\satfix.ini`（默认模板见 [`plugin/defaults/satfix.ini`](plugin/defaults/satfix.ini)）。文件缺失时自动使用内置默认值；修改后每 2 秒自动热重载，无需重启游戏。
+
+| 配置项（`[general]`） | 默认值 | 说明 |
+| --- | :---: | --- |
+| `enabled` | `true` | 总开关；`false` 表示不安装钩子 / 停用判定 |
+| `verbose_events` | `true` | 是否逐条记录 EVENT 日志；关闭后只保留计数与心跳 |
+| `heartbeat` | `false` | 是否开启周期汇总日志 |
+| `heartbeat_every` | `200000` | 每累计 N 次 hook 调用打印一次分类计数 |
+| `max_hp_cap` | `1000000000000000000` | 退化路径下的上限阈值（CFixedPoint 存储值，`1e18` ≈ `1e13` 游戏单位） |
+| `verify_max_hp` | `true` | 开启护盾/装甲/船体上限重算与塌 0 兜底；设为 `false` 退化为仅检负值 |
+| `verify_variables` | `false` | 变量系统影子复算开关（4.6.0 源码 `kVarShadowSupported=false` 已强制停用） |
+| `diag_recompute_calls` | `0` | 诊断开关：打印前 N 次上限重算中间量与 HULLMAP 偏移扫描（**会绕过早退热路径，排查完请改回 0**） |
+| `diag_modifier_calls` | `0` | 诊断开关：统计 `ApplyModifierMult` 的 ModifierType 直方图（有逐调用原子加开销，默认关） |
+| `log_recompute_mismatch` | `false` | 记录「重算 ≠ 游戏但未触达回写闸门」的 NOTE 日志（默认关） |
+| `collapse_log_limit` | `64` | 「加算溢出塌成 0」事件最多记录多少条（按 design 指针去重防刷屏） |
+
+**日志**：写入 `<插件目录>\logs\satfix.log`，以 `_wsopen_s(..., _SH_DENYNO)` 打开确保游戏运行期间可随时读取，上限 `20000` 行，首行打印版本、构建模式、游戏路径、PE 时间戳校验与 14 组进程内自检结果。
+
+---
+
+## 6. 构建、自测、探针与发布
+
+### 6.1 编译与自动化自测
+
+需要 VS 2022 Build Tools（x64 C++ 工具链 + Windows SDK）与 Python 3。
 
 ```powershell
-python tools\win_dump_index.py --dump ..\..\_analysis\stellaris_4.5.2_win_symbolized.cpp `
-    --index ..\..\_analysis\win_dump_index.jsonl --fun FUN_141b4c170 --body
+cd satfix-win
+
+.\build.ps1                # 影子模式（默认，开发/观察用）
+.\build.ps1 -Replace       # 回写模式（发布版必须用这个）
+.\build.ps1 -TestOnly      # 仅跑 winhook 单元测试
 ```
 
-### 3.0 一条定位捷径：CFixedPoint 的成员成簇排布
+构建脚本串联 4 项自动化验证，任一失败即中止：
+1. `test_winhook.exe` —— hook 引擎合成机器码测试（含 rel8 加宽、线程挂起补丁、卸载重装、坏目标拒绝）；
+2. `test_stl_fix_win.exe` —— 128 位定点饱和算术离线对拍 + `satfix_decision.hpp` 14 组自检向量；
+3. `test_load_plugin.exe` —— 在宿主进程中 `LoadLibrary` 验证 `DllMain` 返回时长、目录定位、日志共享可读性与导出统计接口；
+4. `tools/check_plugin_pkg.py` —— 按插件手册 §13 校验 `dist\satfix\` 清单合法性与包内容纯净度（不含 `--exe` 时 24 项，带 `--exe` 时 25 项）。
 
-`0x1B4C0A0`–`0x1B4C600` 这段密集排着 CFixedPoint 的成员函数（同一 COMDAT 组）：
+> 注意：更新 DLL 前请先退出正在运行的 `stellaris.exe`，否则复制覆盖 `plugin\satfix.dll` 会因文件占用失败。
 
-```
-0x1B4C0A0  operator fpml<...,15>() const      -> cfx_to_fp15
-0x1B4C100  GetRounded(fpml<...,15> const&)    -> cfx_get_rounded_fp15
-0x1B4C170  GetRounded()/GetRounded64()        -> cfx_get_rounded
-0x1B4C1B0  RoundTo(CFixedPoint const&)        -> cfx_round_to
-0x1B4C2D0  Atan2(CFixedPoint const&, ...)     -> cfx_atan2
-0x1B4C600  （缩放+循环，Sqrt 族候选，未确证）
-0x1B4C840+ std::string 解析（0xf SSO 判定）等无关函数，排除得很干净
-```
-
-`GetRounded` 与 `GetRounded64` 的 Linux 函数体完全相同，MSVC 的 COMDAT 折叠把它们合并成
-了一份，所以只有一个地址。这也解释了为什么按名字查 `GetRounded` 得 0 命中、按形状查只有
-1 个孪生。
-
-### 3.1 `cfx_get_rounded` — RVA `0x01B4C170`（EXACT）
-
-Windows（`FUN_141b4c170`，17 行）：
-
-```c
-lVar1 = *param_1;
-lVar2 = lVar1 + -50000;
-if (-1 < lVar1) { lVar2 = lVar1 + 50000; }
-return lVar2 / 100000;
-```
-
-Linux（`CFixedPoint::GetRounded` 反编译 8599412 / `GetRounded64` 8599430，
-两个函数体完全相同）：
-
-```c
-lVar1 = *(long *)this;
-if (-1 < lVar1) return (lVar1 + 50000U) / 100000;
-return -((50000U - lVar1) / 100000);
-```
-
-逐字一致。MSVC 的 COMDAT 折叠把这两个相同函数合并成了一份，所以只有一个地址，这与
-脚本里查 `GetRounded` 得 0 命中、`GetRounded` 形状的孪生只有 1 个互相印证。
-
-这是唯一一个已实测确认会溢出的目标，不依赖任何 mod 数值假设。`x + 50000` 与
-`50000 - x` 各在一端溢出，实测：
-
-```
-INT64_MAX: 游戏 = -92233720368547   饱和 = +92233720368547
-INT64_MIN: 游戏 = +92233720368547   饱和 = -92233720368547
-```
-
-### 3.2 `cfx_to_fp15` — RVA `0x01B4C0A0`（EXACT）
-
-Windows（`FUN_141b4c0a0`，10 行）：
-
-```c
-*param_2 = ((*param_1 % 100000) * 0x40000000) / 0xc3500000 + (*param_1 / 100000) * 0x8000;
-```
-
-Linux（`CFixedPoint::operator_cast_to_fixed_point` 反编译 8599274，即
-`operator fpml::fixed_point<long long,48,15>()`）：
-
-```c
-*(long *)this = ((*param_1 % 100000) * 0x40000000) / 0xc3500000 + (*param_1 / 100000) * 0x8000;
-```
-
-公式逐字节相同。ABI 由机器码加调用点确证，这是两次踩坑换来的：机器码前 6 字节里
-`4c 8b 01` = `mov r8,[rcx]`（源从 rcx 进来且解引用）、`4c 8b d2` = `mov r10,rdx`
-（返回槽是 rdx）；调用点是 `FUN_141b4c0a0(&DAT_1431517c8, local_368)`，第一个实参是源、
-第二个是结果变量。
-
-所以 C++ 参数顺序是 `(src, ret)`。实机探针（4 个输入）返回值
-`40454 / 3022314549036572936 / -3022314549036572936 / 0` 与模型逐位吻合，0 分歧，
-这与 Linux 侧认为该换算溢出不了的结论也一致。
-
-> 曾经找错目标：`FUN_14075a370` 的函数体公式和这个完全一样，但它的调用点全是
-> `FUN_14075a370(&local_res20, 1000)` 这种第二个参数为缩放标量的形式
-> （1000/10000/100000/1000000），所以它是另一个带缩放参数的换算。我最早把 `0x75A370`
-> 当目标，活体探针四个输入返回同一个常数 `1767657313`，因为我的 `&x` 被当成了缩放值。
-
-### 3.3 `cfx_round_to` — RVA `0x01B4C1B0`（OBSERVE）
-
-Windows（`FUN_141b4c1b0`，31 行）与 Linux `CFixedPoint::RoundTo`（反编译 8599448）同构：
-先按 `lVar3 + 0x53e2d6238da3U < 0xa7c5ac471b47` 判量级，小量级走 `(x*100000)/200000`、
-大量级走 `(lVar2%200000)*100000/200000 + (x%100000)*100000/200000` 的拆分路径，结尾：
-
-```c
-*param_1 = lVar3 - lVar3 % lVar2;
-return lVar3 / lVar2;
-```
-
-与 Linux 版的 `*(ulong *)this = uVar3 - (long)uVar3 % (long)uVar4; return (long)uVar3 / (long)uVar4;`
-逐字对应。ABI 是非 sret（返回值在 rax）；rcx = this（会被就地改写），rdx = 除数。
-
-实机探针：`self=1234567, div=1000 → self'=1235000, q=1235`；`div=200000 → 1200000, q=6`
-（手算 `1234567+500=1235067`，`1235067/1000=1235` 余 67；`1235067/200000=6` 余 35067，
-`1235067-35067=1200000`），完全吻合。
-
-列为 OBSERVE 是因为 Linux 侧同样只观测（记 `divisor==0` 与 `v+divisor/2` 溢出）。
-本移植的 detour 也顺带检查 `divisor == 0`，那会让游戏直接 #DE 崩掉。
-
-### 3.4 `cfx_atan2` — RVA `0x01B4C2D0`（OBSERVE）
-
-Windows（`FUN_141b4c2d0`，98 行，Linux Atan2 也是这个量级）同时命中 Atan2 的五个标志常量：
-
-| 常量 | 含义 |
-|---|---|
-| `0x132cb` | `π/4 × 1e5` = 78539（Linux 版 `(long)(uVar8 * 0x132cb) / 100000`） |
-| `0x39863` | `π × 1e5` = 235619（Linux 版 `lVar5 = 0x39863`） |
-| `0x53e2d6238da3` | 与 RoundTo/Sqrt 共用的量级安全界 |
-| `0xb504f333` / `0x16a09e667` | 中间积不撑爆 int64 的安全域 |
-
-五个同时出现，是这一族里最强的一次指纹命中。ABI 是 sret(rcx=返回槽) 加两个 CFixedPoint
-指针(rdx, r8)。实机探针 `(1.0,1.0) → 78539`（正是 π/4×1e5）、`(1.0,0) → 157078`
-（≈π/2×1e5），返回值与数学期望逐位吻合，身份与 ABI 都对。
-
-列为 OBSERVE 是因为 Linux 侧同样只观测（记参数平方会溢出的量级），而 Atan2 是多项式逼近，
-重写逐位等价参考实现成本高且容易错（Linux README 第 5 节）。
-
-### 3.5 `cfx_get_rounded_fp15` — RVA `0x01B4C100`（OBSERVE）
-
-Windows（`FUN_141b4c100`，23 行）与 Linux `CFixedPoint::GetRounded(fpml<...,15> const&)`
-（反编译 8599289）结构同构，四个特征常量 `0x8000` / `0xf` / `0xc3500000` / `0x4000`
-与 Linux 版逐一对上。
-
-> ⚠️ **ABI 勘误（2026-11-06）**：本节原先写「ABI 是非 sret，参数是 fp15 位模式」，
-> **错了**。按 4.5.2 Windows dump 的函数体 `uVar1 = *param_2; *param_1 = ...; return param_1`
-> 与两处调用点（`FUN_141b4c100(local_res10,&local_res8)`），它是 **sret 两参**：
-> `rcx = 输出槽`、`rdx = 输入`。0.4.0 按单参写导致游牧局研究科技 CTD，
-> 详见 §0.3.1；修复后的探针输出 `0 -> 0` / `0x8000 -> 100000` / `-0x8000 -> -100000`。
-
-Linux 侧同列 OBSERVE，本移植也只计数、不判罚。
-
-### 3.6 `var_multiply` — RVA `0x01777F00`（OBSERVE）
-
-> **RVA 已更正**：本节标题原先写 `0x00231640`，那个地址**装错了函数**，已被 0.1.3 推翻。
-> 正确地址是 `0x01777F00`（由 Linux 侧那条独占诊断串
-> `multiply_variable: variable %s is not set for scoped %s '%s' at %s` 唯一命中）。
-> 策略**当前是 OBSERVE**（见 0.1.4 的更正说明），不是 EXACT。
-> 下面保留原样存档的是**当时观测到的现象**，对象是那个错误的 `FUN_140231640`。
-
-Windows（`FUN_140231640`，**旧地址、已证伪**，保留存档）：
-
-```c
-if ((lVar2 + 0xb504f333U < 0x16a09e667) && (param_3 + 0xb504f333U < 0x16a09e667)) {
-    *plVar7 = *plVar7 + (lVar2 * param_3) / 100000;
-    return;
-}
-...
-*plVar7 = *plVar7 + ((lVar5 % 100000) * param_3) / 100000 + (lVar5 / 100000) * param_3;
-```
-
-`0xb504f333 = 3037000499`、`0x16a09e667 = 6068000998 = 2*3037000499+1`，正是中间积不撑爆
-int64 的界，与 Linux `CModifier::ApplyModifierMult` 同源。
-
-当时列为 OBSERVE 的理由是累加目标是 `CModifier` 内部 `0x10` 步长的条目数组
-（`*(longlong*)((longlong)(int)uVar6 * 0x10 + *(longlong*)(param_1 + 0x38))`），语义未逆清，
-无法精确复算写回值，所以只记被调用过。
-
-> 顺带一提：**真正的** CModifier 放大出口是 `apply_mul_cfx` = `0x36DF80`（已确证、EXACT），
-> 那条路已单独确证，与变量系统无关。
-
----
-
-## 4. 编译 / 运行
-
-需要 VS 2022 Build Tools（x64 C++ 工作负载 + Windows SDK）。本机是
-MSVC 14.44.35207 + Windows SDK 10.0.26100.0。
-
-```powershell
-.\build.ps1              # 影子模式：跑全部自测 + 编译 + 组包 + 包合规检查
-.\build.ps1 -Replace     # 打开溢出回写
-.\build.ps1 -TestOnly    # 只跑 hook 引擎自测
-```
-
-`build.ps1` 会依次跑三套自测，任何一套失败都中止：
-
-```
-test_winhook.exe       25/25   hook 引擎（合成机器码，不开游戏）
-test_stl_fix_win.exe   58/58   定点饱和算术对拍 + 判定逻辑自检向量表
-test_load_plugin.exe   23/23   插件管线（宿主 LoadLibrary）
-check_plugin_pkg.py    23/23   插件包合规（手册第 13 节）
-```
-
-安装与启动：
+### 6.2 本地联调与活体探针
 
 ```powershell
 $stl = "$env:LOCALAPPDATA\Programs\Stellaris Launcher\stl.exe"
-& $stl plugin install .\plugin --link    # 开发时用链接
+& $stl plugin install "$PWD\plugin" --link
 & $stl plugin enable satfix
 & $stl launch
-Get-Content .\plugin\logs\satfix.log     # ← 看这里
+Get-Content .\plugin\logs\satfix.log
 ```
 
-也可以手动注入已在运行的游戏：`& $stl inject .\plugin\satfix.dll`。
-
-### 活体探针（验证 EXACT 检出链，不需要读档）
+**活体探针**（仅在排查纯函数 ABI 或验证回写端到端链路时使用，正常游玩切勿开启）：
 
 ```powershell
-$env:SATFIX_WIN_FORCE = '1'          # 触发活体探针
-& $stl launch                        # 或先开游戏再 stl inject
-# 日志里会出现「探针 GetRounded in=… -> game=…」与对应的 EVENT
+$env:SATFIX_WIN_FORCE = '1'
+& $stl launch
+# 初始化末尾会使用边界值直接探测 GetRounded / to_fp15 / GetRounded(fp15) / RoundTo / Atan2 / Sqrt / SafeSqrt
 ```
 
-`SATFIX_WIN_FORCE=1` 同时会绕过必须是 `stellaris.exe` 的检查（给离线自测用），正常游玩
-不要设它。探针只调两个纯函数、不改任何东西，全程有 SEH 包住。
+`SATFIX_WIN_FORCE=1` 同时用于离线测试绕过进程名检查（仍保留 PE 时间戳与序言签名校验）。
 
-### 游戏更新后（4.5.3 重定位记录）
-
-游戏升到 **Cygnus v4.5.3**（`stellaris.exe` 构建 `0x6AE49C1B`）时，4.5.2 的地址全部失效。
-这次没有重跑整套原始分析，走的是一条更省、也更硬的路线：**拿旧构建的机器码当密码本做掩码比对**。
-
-1. 4.5.2 时期的 Ghidra 工程（`_analysis/stellaris-c452`）还在，用 pyghidra **只读**打开，
-   把 25 个目标函数的机器码整段取出来 -> `tools/relocate/old_bytes_452.json`；
-2. `tools/relocate/scan_in_new_exe.py`：用 capstone 把 `call`/`jmp` 的 rel32、RIP 相对寻址的 disp32
-   **标记为通配**，其余字节逐个比对新 exe 的 `.text`。命中唯一 = 同一段机器码 = 同一个函数；
-3. `tools/relocate/verify_pdata.py`：再用 PE 的 `.pdata` 异常表独立复核 —— 每个非叶子函数一条
-   `RUNTIME_FUNCTION`，`BeginAddress` 就是编译器给的函数起点，顺便比对函数长度是否与 4.5.2 相同；
-4. 形变的那两个（`diplo_weight` / `ship_size_max_hp`）改用 `tools/relocate/instr_match.py` 的
-   **指令形状相似度**（助记符 + 操作数种类 + 寄存器名，立即数/位移全部折叠）；
-   身份再由 `tools/relocate/callcheck.py` 的**调用点序列**落地；
-5. 最后 `tools/relocate/decomp_453.py` + `compare_decomp.py`：给 4.5.3 跑一遍 Ghidra 分析
-   （785 秒、110,892 个函数），让 Ghidra 在新地址上**自己重新识别函数并反编译**，
-   再与 4.5.2 的 dump 逐函数比语义。这一步不碰字节比对的结果，是独立复核。
-
-| 目标 | 4.5.2 | 4.5.3 | 位移 | 证据 |
-| --- | --- | --- | --- | --- |
-| `cfx_get_rounded` | 0x1B4C170 | 0x1B50CE0 | +0x4B70 | 50B 字节全等，唯一命中 |
-| `cfx_to_fp15` | 0x1B4C0A0 | 0x1B50C10 | +0x4B70 | 87B 全等 |
-| `cfx_get_rounded_fp15` | 0x1B4C100 | 0x1B50C70 | +0x4B70 | 111B 全等 |
-| `cfx_round_to` | 0x1B4C1B0 | 0x1B50D20 | +0x4B70 | .pdata size 282 = 旧 282 |
-| `cfx_atan2` | 0x1B4C2D0 | 0x1B50E40 | +0x4B70 | 810B 全等（.pdata 切成 4 块：8+543+9+250） |
-| `cfx_sqrt` | 0x1B489D0 | 0x1B4D540 | +0x4B70 | .pdata size 686 = 旧 686 |
-| `cfx_safe_sqrt` | 0x1B4C600 | 0x1B51170 | +0x4B70 | .pdata size 573 = 旧 573 |
-| `apply_mul_cfx` | 0x36DF80 | 0x36E990 | +0xA10 | .pdata size 286 = 旧 286 |
-| `apply_mul_fp15` | 0x36E0A0 | 0x36EAB0 | +0xA10 | .pdata size 206 = 旧 206 |
-| `hull_max` | 0xA112A0 | 0xA152E0 | +0x4040 | .pdata size 2784 = 旧 2784 |
-| `shield_max` | 0xA11D80 | 0xA15DC0 | +0x4040 | .pdata size 2960 = 旧 2960 |
-| `armor_max` | 0xA12910 | 0xA16950 | +0x4040 | .pdata size 2558 = 旧 2558 |
-| `damage_per_day` | 0xA14C60 | 0xA18CA0 | +0x4040 | .pdata size 4336 = 旧 4336 |
-| `mpe15` | 0xA0A4A0 | 0xA0E4E0 | +0x4040 | .pdata size 356 = 旧 356 |
-| `mpe7` | 0xA0A610 | 0xA0E650 | +0x4040 | .pdata size 341 = 旧 341 |
-| `var_add` | 0x1777800 | 0x177BF60 | +0x4760 | .pdata size 137 = 旧 137 |
-| `var_multiply` | 0x1777F00 | 0x177C660 | +0x4760 | .pdata size 604 = 旧 604；10 个 call 目标顺序全对 |
-| `diplo_weight` | 0x838670 | 0x839B40 | +0x14D0 | 整段 666B（.pdata 切成 43+74+524+5+20）；前 178 条指令逐条相同 |
-| `ship_size_max_hp` | 0xD2B6E0 | 0xD30A70 | +0x5390 | 指令相似度 0.9941（424 vs 421 条），1858 -> 1870 字节 |
-| `access_var_pointer` | 0x9F7DF0 | 0x9F99B0 | +0x1BC0 | .pdata size 205 = 旧 205 |
-| `cvars_get` | 0x227390 | 0x2272C0 | -0xD0 | .pdata size 217 = 旧 217 |
-| `cvars_set` | 0x7AAE10 | 0x7AC110 | +0x1300 | .pdata size 108 = 旧 108 |
-| `cfp_getvalue` | 0x34D500 | 0x34DF70 | +0xA70 | 函数长度 1470 相同；**身份由调用点确证**（见下） |
-| `ship_size_of` | 0x30E990 | 0x30F330 | +0x9A0 | .pdata size 69 = 旧 69 |
-| `modifier_value` | 0xD29DD0 | 0xD2F160 | +0x5390 | .pdata size 312 = 旧 312；与 ship_size_max_hp 同位移互证 |
-
-**25 个地址里 23 个字节级完全一致**（连函数长度都分毫不差）。形变的两个：
-`diplo_weight` 的收尾被寄存器分配改过（旧版把 rbx 存回栈，新版没有）；
-`ship_size_max_hp` 有一处 `cmp [rax+..], ecx` 被展开成显式分支。
-
-`cfp_getvalue` 是这批里最值得记的一个：整段字节比对只到 0.988（几处立即数/偏移变了），
-指令级相似度仅 0.70，**单看形状不够定身份**。真正落地靠调用点 ——
-新 `var_multiply`（0x177C660）的第 8 个 `call` 目标就是 0x34DF70，与 4.5.2 里第 8 个
-call 目标 0x34D500 位置逐一对应；同函数另外 9 个 call 目标也全部对上。
-
-### 4.5.3 的实机验证记录
-
-`stl launch` 之后 `plugin/logs/satfix.log` 里的关键几行：
-
-- `exe build 0x6AE49C1B（期望 0x6AE49C1B）`
-- `目标: 签名校验通过 19/19，未定位 1（见下），本构建适配 19`
-- `辅助函数: 签名校验通过 6/6（变量系统 EXACT 可用）`
-- 19 条 `hooked <key> @ <addr>`，**无一条被停用**；调用计数持续增长
-  （一分钟内 `Atan2` 110 万、`ApplyModifierMult(cfx)` 40 万、`CalcMax*` 各 4.5 万、
-  `CalcAverageDamagePerDay` 2.4 万、`CShipSize::PostReadInit` 319）
-- 临时打开 `diag_recompute_calls` 后：护盾/装甲/船体的**重算值与游戏值逐位相同**
-  （1000000000 / 180000000 / 580000000，另一条船 20000000 / 10000000 / 20000000），
-  零条「重算≠游戏」告警 —— 说明 `ship_size_of` / `modifier_value` 在 4.5.3 上也取对了值
-- `DIAG HULLMAP size=... base_raw=1000000000 (10000.0000) 命中偏移: 6b8` ——
-  `CShipSize` 的 `max_hitpoints` 偏移在 4.5.3 上**没有漂移**（这条曾在 4.5.2 时期踩过坑，见 §7）
-
-Ghidra 在 4.5.3 上把这 25 个地址**全部**识别为函数入口；反编译语义与 4.5.2 对比：
-10 个完全相同（1.0000），其余 0.91~0.997（`access_var_pointer` 0.8685、`ship_size_max_hp` 0.9105）。
-
-### 下次游戏更新后
+### 6.3 打包与发布
 
 ```powershell
-python tools\gen_targets_win.py --check   # 签名/时间戳漂移 -> 非 0 退出
+cd satfix-win
+.\build.ps1 -Replace
+.\tools\package_release.ps1
 ```
 
-漂移了就照上面的流程重定位（旧工程 + 掩码比对 + .pdata 复核 + 调用点 + 反编译复核），
-然后 `tools\gen_targets_win.py` 重新生成，并把新的 `exe_timestamps` 换成这次实测的构建。
+打包脚本校验构建模式为 `write-back`、包内不含 `config\`/`logs\`、提取 `RELEASE_NOTES.md` 中对应的 `## v<version>` 段落，在 `release\` 下生成 `satfix-v<version>.zip`、`.sha256` 与 `.zip.notes.md`，并打印 `gh release create` 命令。
 
 ---
 
-## 5. 怎么继续补剩下的目标
+## 7. 游戏更新后的重定位
 
-已经在 Windows dump 里建好了索引与指纹工具，补一个目标大约四步：
+游戏更新后第一步运行漂移检查：
 
 ```powershell
-# 1) 从 Linux dump 取参考函数体，看清它的「形状」
-#    （CFixedPoint 成员先从 0x1B4C0A0 附近的簇里找，最快）
-python tools\win_dump_index.py --dump ..\..\_analysis\stellaris_4.5.2_win_symbolized.cpp `
-    --index ..\..\_analysis\win_dump_index.jsonl --rva 0x1b4c600 --body
-
-# 2) 在 Windows 侧按常量指纹筛候选
-python tools\win_fingerprint.py --dump ..\..\_analysis\stellaris_4.5.2_win_symbolized.cpp `
-    --index ..\..\_analysis\win_dump_index.jsonl --report --tag cfx_to_fp15
-
-# 3) 【关键】ABI 不能靠函数体猜，要看两处：
-#    a. 函数头（dump 里的签名，参数个数/类型）
-#    b. 调用点（`FUN_xxx(` 在本 dump 里的形态）—— 决定寄存器里到底是什么
-#    两者的教训见 0.3/0.4：0x75A370 vs 0x1B4C0A0 函数体一样、ABI 不同。
-
-# 4) 把 (key, 描述, RVA, 策略, 证据) 加进 tools\gen_targets_win.py 的 CONFIRMED
-#    -> python tools\gen_targets_win.py 重新生成头文件
-#    -> 在 src\sat_guard_win.cpp 里补 detour（纯函数再加活体探针）
-#    -> pwsh -NoProfile -File run_inject_test.ps1   # 实机验证
+python tools\gen_targets_win.py --check
 ```
 
-加探针是这套流程里最划算的一步。只要目标接近纯函数，探针就能在几秒内于真进程里把 ABI
-与身份同时证伪或证实，比读档快得多，0.3 的两个坑都是它抓到的。
-
-现成的指纹工具（`win_fingerprint.py`）已经能给出分类候选，当前的命中数：
-
-| 标签 | 函数数 | 说明 |
-| --- | ---: | --- |
-| `cfx_split_mul` | 772 | `(X%1e5)*Y/1e5 + (X/1e5)*Y` 的拆分乘法形状 |
-| `fpml7_shift` | 359 | `>>7` 方言 |
-| `fpml15_shift` | 263 | `>>15` 方言 |
-| `cfx_get_rounded` | 140 | `+50000` 且 `/100000` |
-| `cfx_to_fp15` | 53 | `0x40000000` 且 `0xC3500000` |
-| `cfx_round_maybe` | 82 | 四舍五入到 1e5 倍数 |
-
-### 5.1 剩下的目标为什么不是「再花点时间」就能解决
-
-> ⚠️ **本节是历史存档**：那时的「剩下的 16 个」后来**全部定位完了**（19/20，唯一未定位的
-> `cfx_safe_sqrt_int` 已判定 Windows 侧不存在）。当时总结的三条判据 —— 类型恢复、BSim、
-> 活体探针的局限 —— 如今被**更有效的三条**取代：NDefines 名字法（0.1.8、0.1.10）、
-> **片区扫**（0.1.14，靠它救回了一次错误定位）、**ModifierType 序列逐个比对**（0.1.14）。
-> 下面的证据表仍然有效，它记录的是「当时试过什么、为什么不够」。
-
-我把剩下的 16 个都试过一轮指纹，结论是它们需要的不是更多常量匹配，而是类型恢复。证据：
-
-| 尝试 | 结果 |
-|---|---|
-| 常量指纹（6/7 命中 CModifier 惯用法） | 75 个函数，无法区分 |
-| 加锐（要求 `+0xa0`/`+0xa8` 与 `*0xb0` 同块的表查找组合） | 仍有 65 个 |
-| `0xb504f334` 当 Sqrt 独有常量 | 证伪，它出现在若干 CModifier 惯用法里 |
-| `win_linux_mapping` 里的 `ExecuteActual` | 133 条，全部只标 `ExecuteActual`，无法区分加法/乘法版本 |
-| `win_linux_mapping` 里的 `GetVariable` / `AccessVariablePointer` | 0 命中 |
-| `win_linux_mapping` 里的 `CalcMaxArmorHitPoints` | 1 条，但只给名字 |
-| Ghidra 工程查类型 | 无 PDB ⇒ 工程里没有类型库，反编译器给不出 `CModifier*`，所以拿不到参数类型 |
-
-`apply_mul_cfx` 的首选候选 `FUN_1403e6aa0 @ 0x3E6AA0`（80 行、82 个调用点）形状很像但
-签名对不上：它是 `(a, b, c)`，第 3 个参数当乘数用；而 Linux 版
-`ApplyModifierMult(CFixedPoint&, CModifier const&, ModifierType, bool)`
-的第 3 个参数是**修正类型**（拿去 `*0xb0` 索引全局表）。所以它不是那个函数。
-
-下一步该做的事，按性价比排：
-
-1. 做类型恢复：给 `_analysis/stellaris-c452.rep` 打 `_analysis/_win_rtti_classes.json` 里那 1269 条 MSVC RTTI 名（建类型库把 `param_1` 推成 `CModifier*`），再按参数类型 == CModifier 筛候选。这一步能把 65 个候选直接压到个位数。
-2. 或者用 BSim（需两侧二进制，Linux `stellaris` 与 Windows exe 都在手边），按函数语义相似度匹配，绕开常量指纹。
-3. 确证一个之后，活体探针只能验纯函数。`ApplyModifierMult` 会就地改写 `param_1+0x38` 的 0x10 步长数组，所以要么先逆清那个数组，要么只在 `REPLACE=0` 下先跑影子（读参数 + 只计数）。
-
-在类型恢复做完之前，不建议给这 16 个里的任何一个装钩子。装错目标在 `REPLACE=1` 下会写坏
-存档，而 `REPLACE=0` 也只是多记几行没用的日志。
-
-> 事后看，这条纪律救过场：`var_multiply` 一度被指到 `0x231640`（那是 CModifier 惯用法，
-> 不是变量系统），`damage_per_day` 一度被指到 `FUN_1403c2910`（那是「单件武器」那层）。
-> 两处都是「形状像但身份错」，两处都是靠更硬的判据（独占字符串 / ModifierType 序列）纠回来的。
-> 这正是「宁可漏报，不可误改」在**定位**阶段的同一体现。
+若报告时间戳或序言签名不匹配，请按 [`tools/relocate/README.md`](tools/relocate/README.md) 执行跨版本重定位，并更新：
+1. `tools/gen_targets_win.py` 的目标 RVA 与证据 → 重新生成 `src/satfix_targets_win.generated.hpp`；
+2. `src/sat_guard_win.cpp` 中的 ModifierType 枚举、元数据表地址、船级表地址及必要安全闸；
+3. `plugin/stl-plugin.json` 的 `version` 与 `game.exe_timestamps`；
+4. `RELEASE_NOTES.md` 新增对应版本说明。
 
 ---
 
-## 6. 已知限制
+## 8. 插件规范（v2）合规对照
 
-本节同样是 0.1 之前的快照。0.1.1 已经把 `apply_mul_cfx` / `apply_mul_fp15` 确证下来并装上；
-注意「`var_multiply` 升级成 EXACT」这句**已过时**（当前是 OBSERVE，见 0.1.4 的更正），
-而三个上限函数与 `damage_per_day` 现在是 EXACT。当前状态见第 0 节。下面保留原样存档。
-
-- 覆盖 8/23 个目标（**当时**的数字；当前 **19/20**，见第 0 节）。其中 4 个 EXACT
-  （`cfx_get_rounded`、`cfx_to_fp15`、`apply_mul_cfx`、`apply_mul_fp15`），4 个 OBSERVE。
-  主战场 `ApplyModifierMult` 两个重载已拿下，且实机确认 `apply_mul_cfx` 被调用 144 万次/局。
-- `apply_mul_cfx` / `apply_mul_fp15` 身份未证实，插件不装它们。首选候选 `FUN_1403e6aa0`
-  形状像但签名对不上（第 3 个参数是乘数，而 Linux 版是修正类型），所以它不是。要往下走
-  必须先做类型恢复，详见 5.1。这是刻意的安全失败，不是遗漏。
-- `var_multiply` 只观测，不判溢出、不替换（原因见 3.3）。**这一条当前仍然成立**
-  （它本来就是 OBSERVE），只是理由要换成 0.1.4 里写的那条：EXACT 依赖先读到 `v0`，
-  而 Windows 上 `v0` 的读取路径尚未验证。
-- 正常游玩几乎不会产生 EVENT。原版量级离阈值极远，所以实机 0 条 EVENT 读作预期结果。
-  要验证检出链请用活体探针（第 4 节）。
-- `REPLACE=1` 已实机验证（0.5），但它会真的改写游戏数值，所以默认关闭。要用先备份存档
-  （Linux 版 README 第 7 节⑤ 同样要求），并且清楚它只影响被 hook 到的那几个函数、同段内联
-  副本不受影响。
-- Windows 与 Linux 的对象布局不同（MSVC vs GCC），所以不能用 Linux dump 的 `+0x48` 这类
-  偏移去读写 Windows 进程内存（手册 6.4 明确禁止）。本移植没有依赖任何结构偏移，
-  已装目标的 detour 只读参数本身。
-- `CFixedPoint` 的 `operator+ - * /` 全是内联（Windows 反编译里 `/100000` 出现 7022 处），
-  没有符号，hook 不到，只能抓关口。这是与 Linux 版同样的固有局限。
-- 蹦床按拷贝完整指令实现，不处理指令跨函数/跨页的极端情况，遇到就拒绝安装。
-- `FreeLibrary` 只出现在测试里。游戏里插件永不卸载（手册 6.6）。
-- 手册建议用 `_wfsopen(..., _SH_DENYWR)`，实测在宿主 `LoadLibrary` 场景下
-  `_wfopen_s`/`_SH_DENYWR` 会给出 EACCES，而 `_wsopen_s(..., _SH_DENYNO)` 才真的允许别人读。
-  日志因此用后者，并由 `test_load_plugin` 的可读性断言守住。
-- 活体探针在初始化线程上调用游戏函数。这不违反手册 6.3 的那条（那条针对引擎/UI/逻辑
-  函数），因为这两个目标是纯函数、无全局副作用，而且只在 `SATFIX_WIN_FORCE=1` 时跑。
-  但若将来给非纯函数加探针，必须改成走主线程泵。
-
-### 6.1 本轮新增的已知限制
-
-- **上限重算是「乐观建模」**：条件性船级修正（`0x1c8`/`0x1c9`、`0x1c6`/`0x1c7`）的游戏侧
-  触发条件依赖 `CFleet` 虚表与一个尚未逆清的函数，所以无条件加上。写回闸门（只在游戏值本身
-  呈 wrap 特征时才动手）挡住因此产生的误判 —— 漏项只会让重算**偏小**，偏小的一侧不会把正常值
-  判成溢出。
-- **船体的重算不忠实，但方向安全**（2026-10-11 复核 Linux `CalcMaxHitPoints` 1335070 起、
-  Windows `FUN_140a112a0` 逐段对照得出）。船体的算式比护盾/装甲多出**三段条件累加**，配方里全填 0：
-
-  | 加什么 | 触发条件 |
-  | --- | --- |
-  | `0x1ca` / `0x1cb` | 舰队虚函数 `[0x60]()` 非零 **且** `CFleet::IsInFriendlyTerritory` 为真 |
-  | `0x1ed` | `CShipSize` 的标志位 `& 0x40` |
-  | `0x1ee` + 按尺寸选的 `0x1ef/0x1f0/0x1f1/0x1f2` | 同一个标志位 `& 0x40` |
-
-  **为什么仍然安全**：这三段**全是加法**，漏掉只会让重算**偏小**；而回写闸门只在「游戏值本身
-  已呈 wrap 特征」时才动手，那种情况真值必然远超 92 万亿天花板，饱和乘法一样停在 `INT64_MAX`。
-  漏项影响不到「封顶到哪」—— 天花板是定点格式给的固定值。
-
-  **实测状态**：船体被调用 110 万次、**零 EVENT**。所以准确说法是「没被误伤过」，
-  **不是**「溢出时修对了」。护盾/装甲有后者，船体没有。
-
-- **`v < 0 → 封顶` 分不清「真负」与「wrap 回来的正数」**，靠的是前面那道「重算相等就不动手」
-  挡住真负（见 0.1.13）。对护盾/装甲这道防线可靠（重算逐位忠实）；对船体**不可靠** ——
-  它漏了上面三段加法，理论上存在「`sat != v` 且 `v < 0`」的误判窗口。
-  **决定不修**（2026-10-11 用户裁定）：船体为负时船已经没了，那台船不会再被重算，
-  回写与否无可观察差异。若将来要收紧，判据是「重算也为负则不算 wrap」。
-- **封顶值只能是 `INT64_MAX`**：定点格式本身的天花板。「单组件上限 × N」在数学上做不到，
-  超过就立刻再 wrap，所以 92 万亿游戏单位是物理天花板，不是保守选择。
-- **`damage_per_day` 只影响面板显示**，不影响实际伤害（三条证据见 0.0 变化 3）。
-- **`ship_size_max_hp` 的判据只有「负值」这一条，没有重算比对**。
-  这是刻意的：船体基础值不可能为负，负值即 wrap 的铁证，不需要再算一遍去比对
-  （不像护盾/装甲要靠「重算相等」挡掉真负）。
-  **溢出侧已于 2026-10-12 用专门造的测试 mod 实测通过**（见 0.1.17），
-  不再是「只有没误伤的证据」。
-- **`ship_size_max_hp` 的偏移 0x6b8 已由两条独立路径确认**：①静态推导 —— `ReadMember`
-  的 `this = param_4+0x40` 且读 `this+0x678`，`PostReadInit` 的 `self = param_4`，
-  两者必然指向同一字段；②活体探针 HULLMAP —— 在同一个 CShipSize 里扫「值 == 面板基础值」
-  的槽位，`0x00..0xe00` 只命中 0x6b8 一处。探针样本目前是 3 次、落在同一条 design 上；
-  偏移是结构常量不随存档变，但想扩大样本可把 `diag_recompute_calls` 打开并调大 HULLMAP 上限。
-- **性能**：热路径每局被调用百万到千万次，任何逐调用开销都会被放大成可见的卡顿。
-  已修两处（早退 + `fast_read`），但以后再加诊断必须能一键关掉。
-
----
-
-## 7. 与手册的对照
-
-| 手册条款 | 本移植的做法 |
-| --- | --- |
-| 6.1 `DllMain` 极简 | 只 `DisableThreadLibraryCalls` + `CreateThread`（自测断言 <500ms 返回） |
-| 6.2 从模块地址找插件目录 | `GetModuleHandleExW(...FROM_ADDRESS)`，`test_load_plugin` 验证日志落在 DLL 旁 |
-| 6.3 引擎调用只在主线程 | detour 只做算术+计数；重活走主线程泵 |
-| 6.4 读内存防崩溃 | `whk::safe_read`（`VirtualQuery` 预检 + SEH），坏指针纯透传 |
-| 6.5 与其他插件共存 | detour 一律 `call()` 原函数；不恢复/覆盖他人钩子 |
-| 6.6 不卸载自己 | 没有 `FreeLibraryAndExitThread` |
-| 6.7 其他 | `/MT` 静态运行库；`imports: KERNEL32.dll` 唯一依赖；不弹控制台；x64 |
-| 7 适配游戏版本 | 清单列 `exe_timestamps`，DLL 再自查 PE 时间戳 + 16 字节序言签名 |
-| 8 设置文件 | 读 `config\satfix.ini`，缺失用内置默认值，每 2 秒看 mtime 热重载 |
-| 9 日志与排错 | 写 `logs\satfix.log`，可被他人同时读，上限 500 行，首行记版本/路径/构建 |
-| 13 发布前检查 | `tools/check_plugin_pkg.py`（清单字段、包内不含 `config\`/`logs\`、无编译中间产物） |
-
----
-
-## 8. 与 Linux 版的语义对应
-
-| Linux | Windows | 说明 |
+| 手册条款 | 规范要求 | 本插件实现 |
 | --- | --- | --- |
-| `shk::TypedHook` | `whk::TypedHook` | 同形；少了按符号名安装的重载（Windows 没有符号） |
-| `__int128` | `sf128::U128` | `_umul128`/`_udiv128` |
-| `eirin::saturating_*` | `sf128::*_sat` | 语义相同 |
-| `eirin::fixed_num<...,15>` | `mul_shift_sat(a,b,15)` | 只实现 satfix 用得到的部分 |
-| `cfx::mul_game` | 同名 | 离线对拍用（复现游戏的 wrap 行为） |
-| `cfx::round_to_int_sat` | 同名 | 已与游戏原式对拍，复现出那次溢出 |
-| `SATFIX_REPLACE` | `-DSATFIX_REPLACE` | 同为编译期开关 |
-| `SATFIX_FORCE=1` | `SATFIX_WIN_FORCE=1` | 离线自测绕过必须是 stellaris.exe 的检查 |
-| `SATFIX_HEARTBEAT=N` | `heartbeat_every`（配置项） | |
-| `test/run_abi_check.sh` | `test/test_winhook.cpp` 第 3、4 节 | 用合成机器码，不需要开游戏 |
+| 6.1 | `DllMain` 极简，只创建线程 | 仅 `DisableThreadLibraryCalls` + `CreateThread` + `CloseHandle` |
+| 6.2 | 从模块地址定位插件目录 | `GetModuleHandleExW(FROM_ADDRESS)` + `GetModuleFileNameW` |
+| 6.3 | 引擎函数仅在游戏主线程调用 | 自有线程只做 mtime 检查；重活由主线程泵执行 |
+| 6.4 | 原始内存读取带 SEH；不依赖 Linux 偏移 | `whk::safe_read` / `fast_read`；偏移全部在 Windows 侧独立验证 |
+| 6.5 | 与其他插件共存，必须调用原函数 | 全部通过 `TypedHook::call()` 经蹦床转发，不恢复他人钩子 |
+| 6.6 | 永不自行卸载 | 生产路径无 `FreeLibraryAndExitThread` |
+| 6.7 | `/MT` 静态运行库、x64、不弹控制台 | `/MT`、x64、无 `AllocConsole`、仅导入 `KERNEL32.dll` |
+| 7 | 双层版本检查 | 清单 `game.exe_timestamps` + DLL 校验 PE 时间戳与 16B 序言签名 |
+| 8 | 配置读取、内置默认、热重载 | 读 `config\satfix.ini`，缺失走默认值，每 2 秒检查 mtime 热重载 |
+| 9.1 | 日志写入 `logs\`、运行中可读、有行数上限 | `_wsopen_s` + `_SH_DENYNO`（经实测兼容宿主同时读，见注），上限 20000 行 |
+| 10.1 / 13 | 发布包不含 `config\`/`logs\` 与构建产物 | `build.ps1` 组装 `dist\satfix\` + `check_plugin_pkg.py` 与 `package_release.ps1` 双重把关 |
+
+> 注（手册 9.1 实测调整）：手册建议 `_wfsopen(..., _SH_DENYWR)`，但在实机宿主测试中 CRT `_SH_DENYWR` 会对外部读者返回 `EACCES`；改用 `_wsopen_s(..., _SH_DENYNO)` 配合 `test_load_plugin` 共享可读断言确保行为满足手册意图。
+
+---
+
+## 9. 当前已知限制
+
+1. **4.6.0 两项主动降级**：
+   - `ship_size_max_hp` 的 `CShipSize + 0x6b8` 偏移尚未在 4.6.0 上活体复核，当前版本暂不回写（`kShipSizeWriteEnabled = false`）；
+   - `var_multiply` / `var_add` 因 4.6.0 变量表重构为 token 哈希表，当前停用影子复算（`kVarShadowSupported = false`）。
+2. **上限重算建模边界**：
+   - 护盾/装甲的条件性船级修正（`0x1d4/0x1d5`、`0x1d2/0x1d3`）因依赖 `CFleet` 领土状态而采用乐观累加，由保守回写闸门兜底不误改；
+   - 船体上限未建模三段条件性加法修正，重算偏小但方向安全；理论上若存在「未死舰船且真值为负」的极端情况会出现 `sat != v && v < 0` 窗口，按实机裁定暂不额外收紧（详析见 [`docs/ENGINEERING_NOTES.md`](docs/ENGINEERING_NOTES.md)）。
+3. **仅覆盖非内联关口**：Windows 反编译中 `/ 100000` 展开逾 7000 处，内联副本无法 hook。
+4. **物理天花板**：封顶值固定为 `INT64_MAX`（约 92.2 万亿游戏单位），受限于游戏自身的 64 位定点表示。
+5. **未测试多插件并发**：本机仅在单插件环境下完成长局实机验证。
