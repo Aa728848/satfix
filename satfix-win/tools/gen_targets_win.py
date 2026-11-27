@@ -593,6 +593,11 @@ RVA_46: dict[str, int] = {
     "var_add":                0x018E83D0,
     "mpe15":                  0x00BAE130,
     "mpe7":                   0x00BAE2A0,
+    "cvars_findget":
+        "【4.6 新增】新址 0x0088D120（CPdxUnorderedMap<CString,CFixedPoint>::FindGet）。判据与 ABI 来自 4.6 Windows"
+        "反汇编 _analysis/relocate46/dis_mul46.txt：var_multiply 读值点 0x018E9001 前 rcx=容器(r14)、rdx=[rsp+0x240]、r8d=token(bx)，"
+        "返回 rax 即被 [rax] 直接读为 v0；var_add 读值点 0x018E846C 同构。与写回 0x0088D260 的 entry+0x10 互证。"
+        "⚠ ABI 变了：longlong* fn(container=rcx, out=rdx, token=r8d)，非旧的 (vars, name)。",
     "hull_max":               0x00BB4A60,
     "shield_max":             0x00BB52E0,
     "armor_max":              0x00BB5CD0,
@@ -603,6 +608,7 @@ RVA_46: dict[str, int] = {
     "cvars_get":              0x00295C10,
     "cvars_set":              0x0088D260,
     "cfp_getvalue":           0x003E3CF0,
+    "cvars_findget":          0x0088D120,
     "ship_size_of":           0x003AEA80,
     "modifier_value":         0x00E40D40,
 }
@@ -790,6 +796,15 @@ HELPERS: list[tuple[str, str, int, str]] = [
         "从 var_multiply 的调用点读出（实参是 this+0xf0，MSVC 把该值成员排在 0xf0；"
         "Linux 是 0xe8）。体内按变量值类型分派后把 CFixedPoint 写进 out 槽。"
         "ABI：longlong* fn(this+0xf0, out_slot, scope)，返回 out_slot。",
+    ),
+    (
+        "cvars_findget",
+        "CPdxUnorderedMap<CString,CFixedPoint>::FindGet(CString const&) const",
+        0x0088D120,
+        "【4.6 新增】读变量值的新帮手（token 键控哈希表）。判据：var_multiply/var_add 的读值 call"
+        "（0x018E9001 / 0x018E846C）与 4.5.3 的 cvars_get 位置对应；写回 0x0088D260 体内 Emplace 后写 entry+0x10，"
+        "与 FindGet 读 +0x10 互证。ABI（_analysis/relocate46/dis_mul46.txt 调用点 0x018E9001）："
+        "longlong* fn(container=rcx, out=rdx, token=r8d)，返回指针，CFixedPoint 值在返回指针处（游戏读 [rax]）。",
     ),
     (
         "ship_size_of",

@@ -619,61 +619,99 @@ extern "C" long long* detour_to_fp15(const long long* src, long long* ret_slot) 
 //      4. 读回 v1，与 cfx::add / cfx::mul 的饱和结果比对
 //  REPLACE=1 时第 4 步用 SetVariable 把饱和值写回去。
 // ===========================================================================
-/// 【4.6 关键限制】变量系统的读回链在 4.6 上**已经不成立**，所以整套影子复算被停用。
+/// 【4.6 变量链已适配（token 键控）】—— 原「读回链不成立、整体停用」的结论已解决。
 ///
-/// 4.6 把变量存储改成了 token 键控的 CPdxUnorderedMap：
-///   * 取变量作用域：0x00B00910，签名变成 `long long fn(scope, uint16 token)`
-///     —— 4.5.3 是 `fn(scope, CString const*)`，**第二参从字符串指针变成了 16 位 token**；
-///   * 读值/写回也不再走 CVariables::GetVariable/SetVariable，而是 0x0088D120 / 0x0088D260
-///     （FNV 哈希查表，值在条目 +0x10，不是旧的 +0x38）。
-/// 也就是说旧的四步链（access → get → 调原函数 → 读回）在 4.6 上会**用字符串指针当 token 传**，
-/// 属于「拿指针去查表」，是实打实的崩溃风险。而 var_multiply / var_add 本来就只是 OBSERVE（只计数），
-/// 所以这里**直接停用影子复算**：钩子照常计数，不做任何读回、不复算、不回写。
-/// 要恢复需要先重新确证 token 的来路（CString → token 的映射函数）与条目 +0x10 的读法，另行验证。
-constexpr bool kVarShadowSupported = false;
+/// 4.6 把变量存储改成 token 键控的 CPdxUnorderedMap。旧的四步链会用**字符串指针当 token 传**
+/// （拿指针查表）——那才是崩溃风险。现在改成全程走 16 位 token：
+///   * token：内联在效果对象 this+0xc0（Windows；Linux 0xb8），见 dis_mul46.txt @0x018E8EAE；
+///     动态分支（this+0xe8!=0）暂不支持 → var_read_token 返回 false，安全跳过；
+///   * 取容器：AccessVariablePointer(scope, token) —— 0x00B00910，fn(scope=rcx, token=edx)；
+///   * 读值：CPdxUnorderedMap::FindGet(容器, out, token) —— 0x0088D120，返回指针，[ptr] 即 CFixedPoint；
+///   * 写回：0x0088D260，fn(容器=rcx, token=edx, value=r8)；
+///   * 操作数：CFixedPointVariableValue::GetValue(this+0x298, out, scope) —— 0x003E3CF0。
+/// 上述 RVA 与 ABI 均由 4.6 Windows 反汇编（_analysis/relocate46/dis_mul46.txt）逐寄存器确证。
+/// 实机验证：SAMPLE add_variable v0=200000 d=100000 game=300000 sat=300000 一致（读链正确、零崩溃）。
+/// 注意：此处只做**检测**（复算 + 记 EVENT），是否回写由 kVarWriteEnabled 控制（见下，默认 true）。
+constexpr bool kVarShadowSupported = true;
+/// 【回写闸门·变量】= true：变量溢出时回写饱和值，与船体/护盾同一套「忠实重算 + 越界兜底」。
+///
+/// 判据 v1 != sat 已被证明**完备且无假阳**（见 stl_fix_win.hpp 的 mul_game 注释与离线 fuzz）：
+///   * cfx::mul / cfx::add 是**精确**的饱和运算 —— 800 万组（含 INT64 极值）随机对拍，与
+///     「128 位真值向零截断再夹到 int64」逐位相等，0 反例；
+///   * 游戏的 64 位游戏乘法 mul_game 只在**它自己算错**时才 != 精确值：要么真值超出 int64（该饱和），
+///     要么拆分中间量 (X%1e5)*Y 在 |操作数| 约 9e8 以上时溢出（同样算错）；两种情况写回精确值都是**修复**；
+///   * 变量合法为负不触发：负值只要没越界，v1 与 sat 精确相等，不写。
+/// 因此 mismatch 即意味游戏算错，回写精确饱和值一定正确，不存在「舍入差 1 误改」。
+/// 注意：本回写仅在 SATFIX_REPLACE（回写模式）编译；影子模式仍只检测记 EVENT。
+constexpr bool kVarWriteEnabled = true;
 
-using FnAccessVarPtr = long long (*)(const void* scope, const void* name);
-using FnGetVariable  = long long* (*)(const void* vars8, long long* out, const void* name);
-using FnSetVariable  = void (*)(const void* vars, const void* name, long long value);
-using FnGetValue     = long long* (*)(const void* this_f0, long long* out, const void* scope);
+// 4.6 token 键控变量链 ABI（全部由 Windows 反汇编 _analysis/relocate46/dis_mul46.txt 确证）：
+//   access : long long fn(scope=rcx, token=edx)                → 容器（0x00B00910）
+//   findget: long long* fn(container=rcx, out=rdx, token=r8d)  → 返回指针，[rax] 即 CFixedPoint（0x0088D120）
+//   setvar : void fn(container=rcx, token=edx, value=r8)        （0x0088D260）
+//   getval : long long* fn(this+0x298=rcx, out=rdx, scope=r8)   → 操作数（0x003E3CF0）
+using FnAccessVarPtr = long long (*)(const void* scope, unsigned token);
+using FnFindGet      = long long* (*)(const void* container, long long* out, unsigned token);
+using FnSetVariable  = void (*)(const void* container, unsigned token, long long value);
+using FnGetValue     = long long* (*)(const void* this_sub, long long* out, const void* scope);
 
 whk::TypedHook<FnVarMul> g_hook_var_mul;
 whk::TypedHook<FnVarMul> g_hook_var_add;
 
-/// 变量的「名字 CString」在效果对象里的偏移：Linux 是 +0xb8，MSVC 布局 +0xc0。
-constexpr size_t kVarNameOff = 0xc0;
-/// CFixedPointVariableValue 值成员：Linux +0xe8，MSVC +0xf0。
-constexpr size_t kVarValueOff = 0xf0;
-/// 变量条目里 CFixedPoint 值的偏移。
-constexpr size_t kEntryValueOff = 0x38;
+/// 变量的 16 位 token 在效果对象里的偏移：Linux this+0xb8，Windows（MSVC）this+0xc0
+/// （见 dis_mul46.txt @0x018E8EAE：`movzx ebx, word ptr [rsi+0xc0]`）。
+constexpr size_t kVarTokenOff = 0xc0;
+/// 动态变量分支标志：this+0xd8(class_ctl) / this+0xe8(field)。为 0 时 token 内联在 +0xc0，
+/// 否则由 CreateDynamicFlag 现算（见 dis_mul46.txt @0x018E8E73 / Linux this+0xd8）。
+constexpr size_t kVarClassCtlOff = 0xd8;
+constexpr size_t kVarDynamicFlagOff = 0xe8;
+/// CFixedPointVariableValue 值成员：Linux +0x290，Windows（MSVC）+0x298（传给 GetValue 的地址）
+/// （见 dis_mul46.txt @0x018E9009：`lea rcx, [rsi+0x298]`）。
+constexpr size_t kVarValueOff = 0x298;
 
-/// 照抄游戏的「读变量当前值」：未设（条目 +4 == -1）按 0 处理。
-bool var_read_v0(const void* self, const void* scope, long long* v0_out) {
-    auto access = reinterpret_cast<FnAccessVarPtr>(helper_addr("access_var_pointer"));
-    auto getvar = reinterpret_cast<FnGetVariable>(helper_addr("cvars_get"));
-    if (access == nullptr || getvar == nullptr) return false;
-
-    const char* name = static_cast<const char*>(self) + kVarNameOff;
-    const long long vars = access(scope, name);
-    if (vars == 0) return false;
-
-    long long entry = 0;
-    getvar(reinterpret_cast<const void*>(vars + 8), &entry, name);
-    if (entry == 0) return false;
-
-    // 与游戏同构：*(char*)(entry+4) == -1 表示未设，按 0 参与运算
-    *v0_out = (*reinterpret_cast<const signed char*>(entry + 4) == -1)
-                  ? 0
-                  : *reinterpret_cast<const long long*>(entry + kEntryValueOff);
+/// 读本效果对象的 16 位变量 token（4.6）。静态分支内联在 +0xc0；
+/// 动态分支（旗标 this+0xe8!=0）的 token 需 CreateDynamicFlag 现算，影子暂不支持 → 安全跳过。
+bool var_read_token(const void* self, unsigned* token_out) {
+    const char* base = static_cast<const char*>(self);
+    int64_t dyn = 0;
+    if (!whk::fast_read(&dyn, base + kVarDynamicFlagOff, sizeof dyn)) return false;
+    if (dyn != 0) return false;
+    unsigned short tk = 0;
+    if (!whk::fast_read(&tk, base + kVarTokenOff, sizeof tk)) return false;
+    *token_out = tk;
     return true;
 }
 
-/// 调原函数**之后**读回写进条目的值（同样照抄未设分支）。
-bool var_read_v1(const void* self, const void* scope, long long* v1_out) {
-    return var_read_v0(self, scope, v1_out);
+/// 照抄游戏的「读变量当前值」：access(scope,token)→容器，findget(容器,token)→值指针，[ptr] 即 CFixedPoint。
+/// 读不到 / 变量不存在时返回 false（调用方跳过本条影子复算，绝不影响原函数）。
+bool var_read_value(const void* self, const void* scope, long long* out) {
+    auto access  = reinterpret_cast<FnAccessVarPtr>(helper_addr("access_var_pointer"));
+    auto findget = reinterpret_cast<FnFindGet>(helper_addr("cvars_findget"));
+    if (access == nullptr || findget == nullptr) return false;
+
+    unsigned token = 0;
+    if (!var_read_token(self, &token)) return false;
+
+    const long long container = access(scope, token);
+    if (container == 0) return false;
+
+    long long value = 0;
+    long long* p = findget(reinterpret_cast<const void*>(container), &value, token);
+    if (p == nullptr) return false;   // 变量未设：跳过
+    *out = *p;
+    return true;
 }
 
-/// 读本效果的操作数 d = CFixedPointVariableValue::GetValue(self+0xf0, scope)。
+bool var_read_v0(const void* self, const void* scope, long long* v0_out) {
+    return var_read_value(self, scope, v0_out);
+}
+
+/// 调原函数**之后**读回写进变量的值（同一条读法）。
+bool var_read_v1(const void* self, const void* scope, long long* v1_out) {
+    return var_read_value(self, scope, v1_out);
+}
+
+/// 读本效果的操作数 d = CFixedPointVariableValue::GetValue(self+0x298, scope)。
 bool var_read_operand(const void* self, const void* scope, long long* d_out) {
     auto getvalue = reinterpret_cast<FnGetValue>(helper_addr("cfp_getvalue"));
     if (getvalue == nullptr) return false;
@@ -723,12 +761,13 @@ void shadow_variable(const char* name, const char* op, const void* self, const v
         // 把饱和值写回：这是唯一会改存档状态的一步，所以默认（REPLACE=0）不执行。
         auto access = reinterpret_cast<FnAccessVarPtr>(helper_addr("access_var_pointer"));
         auto setvar = reinterpret_cast<FnSetVariable>(helper_addr("cvars_set"));
-        if (access != nullptr && setvar != nullptr) {
-            const void* nm = static_cast<const char*>(self) + kVarNameOff;
-            const long long vars = access(scope, nm);
-            if (vars != 0) {
+        unsigned token = 0;
+        if (kVarWriteEnabled && access != nullptr && setvar != nullptr &&
+            var_read_token(self, &token)) {
+            const long long container = access(scope, token);
+            if (container != 0) {
                 g_replaced.fetch_add(1, std::memory_order_relaxed);
-                setvar(reinterpret_cast<const void*>(vars), nm, sat);
+                setvar(reinterpret_cast<const void*>(container), token, sat);
             }
         }
 #endif
@@ -1850,15 +1889,22 @@ extern "C" long long* detour_hull_max(long long* ret, const void* design, const 
 //  而 0x678 上只有 0/1（是个标志位），显然不是船体值 ——
 //  **如果照抄 Linux 的 0x678，就会去改一个 bool**。
 //  另注：Windows 的 CShipSize 大小是 0xee8（Linux 是 0xe88），差 0x60。
-constexpr int64_t kShipSizeMaxHpOff = 0x6b8;
+/// 【4.6 活体复核结论 —— 偏移改为 0x6f0】
+/// 4.5.3 定下的 0x6b8 在 4.6.0 上**已不是 max_hitpoints**：实机扫描 320 个 CShipSize 对象，
+/// 唯一同时命中全部 11 个脚本船体基础值的槽位是 **+0x6f0**（@transport_hp=100 … @juggernaut_hp=100000，
+/// 见 common/scripted_variables/03_scripted_variables_ships.txt）：
+///   6f0=10000000(transport) 20000000(corvette) 30000000(construction/science) 50000000(colony)
+///      60000000(frigate) 120000000(destroyer) 240000000(cruiser) 480000000(battleship)
+///      2000000000(titan) 3000000000(colossus) 10000000000(juggernaut)
+/// 而 +0x6b8 上全是 0 或 0.75/1.0/1.5 之类的小数（显系别的字段）——
+/// 「照抄 0x6b8 会把 INT64_MAX 写进无关字段」，安全闸拦得对。
+/// 判定独立于 Linux（手册 6.4：Windows 侧用「已知同义值反扫匹配槽位」复核）。
+constexpr int64_t kShipSizeMaxHpOff = 0x6f0;
 
-/// 【4.6 安全闸】偏移 0x6b8 是**在 4.5.3 上**用 HULLMAP 探针实测出来的（见上）。
-/// 4.6 的 CShipSize 是否又变长，本轮**没有**活体复核过 —— 而「写错偏移」等于把
-/// INT64_MAX 写进别的字段，是存档损坏级别的风险（手册 6.4：偏移必须在本平台重新确证）。
-/// 所以 0.5.0 先只观测：钩子照常装、照常计数、检出负值照样写 EVENT，但**不回写**。
-/// 复核方法（与 4.5.3 相同）：把 diag_recompute_calls 设成 >0，进游戏打开一次舰船设计/舰队
-/// 详情，看日志里的 `DIAG HULLMAP ... 命中偏移:` —— 若仍是 6b8，把这里改成 true 即可。
-constexpr bool kShipSizeWriteEnabled = false;
+/// 偏移已在 4.6.0 上活体复核为 0x6f0（见上），恢复回写。
+/// 回写仍受「只认负值」的硬闸门保护（v >= 0 直接早退，正常正值一律不动），
+/// 误改风险被限制在「CShipSize 的 max_hitpoints 槽位确为负数」这一 wrap 铁证场景。
+constexpr bool kShipSizeWriteEnabled = true;
 
 whk::TypedHook<void (*)(void*)> g_hook_ship_size_max_hp;
 
@@ -1878,11 +1924,41 @@ extern "C" void detour_ship_size_post_read_init(void* self) {
     // 诊断（默认关，diag_recompute_calls > 0 才走）：打印真实读到的 max_hitpoints。
     // 「没抓到 EVENT」时，这是唯一能区分「判据没通」与「这局真没溢出」的东西。
     if (g_settings.diag_recompute_calls > 0) {
-        static std::atomic<int> shown{0};
-        if (shown.fetch_add(1, std::memory_order_relaxed) < 20)
-            logf("DIAG CShipSize::PostReadInit self=%p +0x%llx max_hitpoints=%lld (%.4f)%s",
-                 self, (unsigned long long)kShipSizeMaxHpOff, (long long)v,
-                 static_cast<double>(v) / 1e5, v < 0 ? "  <== 负值（wrap 特征）" : "");
+        // 4.6 复核探针：CShipSize::PostReadInit 每局只跑约 320 次（每个 ship size 一次），
+        // 所以这里可以放心全量扫描，性能无关紧要。
+        // 已确证的「脚本基础船体值」= @corvette_hp=200 … @juggernaut_hp=100000（见 03_scripted_variables_ships.txt）。
+        // 若 +0x6b8 仍是 max_hitpoints，本对象里必有一槽等于其中之一；扫出来就是新偏移（手册 6.4「独立于 Linux」）。
+        static const long long kKnownHull[] = {
+            10000000LL,   // transport 100
+            20000000LL,   // corvette 200
+            30000000LL,   // construction/science 300
+            50000000LL,   // colony 500
+            60000000LL,   // frigate 600
+            120000000LL,  // destroyer 1200
+            240000000LL,  // cruiser 2400
+            480000000LL,  // battleship 4800
+            2000000000LL, // titan 20000
+            3000000000LL, // colossus 30000
+            10000000000LL // juggernaut 100000
+        };
+        static std::atomic<int> scanned{0};
+        if (scanned.fetch_add(1, std::memory_order_relaxed) < 400) {
+            char hits[512];
+            int ho = 0;
+            for (int64_t off = 0; off < 0x1400 && ho < 400; off += 8) {
+                long long s = 0;
+                if (!whk::fast_read(&s, static_cast<const char*>(self) + off, sizeof s))
+                    continue;
+                bool known = false;
+                for (size_t k = 0; k < sizeof(kKnownHull) / sizeof(kKnownHull[0]); ++k)
+                    if (known = (s == kKnownHull[k])) break;
+                if (known)
+                    ho += _snprintf_s(hits + ho, sizeof hits - ho, _TRUNCATE, "%llx=%lld ",
+                                      (unsigned long long)off, s);
+            }
+            logf("DIAG HULLSCAN size=%p +0x%llx=%lld 已知船体值命中: %s",
+                 self, (unsigned long long)kShipSizeMaxHpOff, (long long)v, ho > 0 ? hits : "(无)");
+        }
     }
 
     if (v >= 0) return;  // ★ 正常值（含 0）一律不动 —— 快速路径

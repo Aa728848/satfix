@@ -2,7 +2,7 @@
   "schema": 2,
   "id": "satfix",
   "name": "satfix — Fixed-Point Overflow Guard",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "When late-game mods stack values too high, shield, armor and hull limits silently collapse to 0 or turn negative, and the damage figure in the ship view or the hull value in the ship designer shows a negative or absurdly large number. This plugin detects the overflow and writes the value back to its proper cap.",
   "dll": "satfix.dll",
   "game": {

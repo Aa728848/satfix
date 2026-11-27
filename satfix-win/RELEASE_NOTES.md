@@ -12,6 +12,31 @@
 
 ---
 
+## v0.5.1
+
+在 v0.5.0（Cygnus 4.6.0 / `0x6AF6BDEC`）基础上处理两处「主动降级」，并修一个启动器报错；仍是回写模式。
+
+### 1. 修：`ship_size_max_hp` 的 `+0x6b8` 在 4.6 已失效 → 纠正为 `+0x6f0`，恢复回写
+
+4.5.3 实测的 `CShipSize + 0x6b8` 在 4.6.0 上已不是 `max_hitpoints`。实机对 320 个 `CShipSize` 对象做「已知脚本船体值反扫」：唯一同时命中全部 11 个基础值（`@transport_hp=100` … `@juggernaut_hp=100000`）的槽位是 **`+0x6f0`**；`+0x6b8` 上是 0/0.75/1.0/1.5 之类小数（别的字段）。偏移改为 `0x6f0` 并恢复回写（仍只认负值，正常正值一律不动）。
+
+### 2. 变量系统（`var_multiply` / `var_add`）适配 4.6 token 键控链 + 恢复回写
+
+4.6 把变量存储改成 token 键控哈希表。已按 4.6 Windows 反汇编逐寄存器确证并接入：token 内联在效果对象 `this+0xc0`（Linux 0xb8），经 `AccessVariablePointer(scope, token)` 取容器；读值走 `CPdxUnorderedMap::FindGet`（`0x0088D120`，值在返回指针处）；写回 `0x0088D260`；操作数 `GetValue(this+0x298, scope)`。
+
+回写判据 `v1 != sat` 已用离线对拍证明**完备且无假阳**：`cfx::add/mul` 是精确饱和运算（800 万组含 INT64 极值随机对拍，与「128 位真值向零截断再夹到 int64」逐位相等、0 反例）；游戏 64 位乘法只在**它自己算错**时才不等于精确值（真值越界，或拆分中间量在 |操作数|≳9e8 时溢出），写回精确饱和值即修复。变量合法为负不触发。
+
+### 3. 修：启动器 `plugins\node_modules` 报错
+
+`plugins\node_modules` 是 MCP 插件的 Node 依赖，落在插件根目录导致启动器把它当插件、报「no stl-plugin.json」。已把它移到 `stellaris-mcp\mcp-server\node_modules`（其 `package.json` 归属处）。
+
+### 验证
+
+- 回写模式构建通过全部离线测试与发布包 25 项合规检查。
+- 实机：`ship_size_max_hp` / `var_multiply` / `var_add` 三钩子装载成功、零崩溃；样本 `SAMPLE add_variable v0=200000 d=100000 game=300000 sat=300000 一致`。
+
+---
+
 ## v0.5.0
 
 清单里的名称与说明改成**全英文**（与其它插件一致）：`satfix — Fixed-Point Overflow Guard`。

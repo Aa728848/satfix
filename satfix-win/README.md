@@ -87,14 +87,14 @@ Windows 版 `stellaris.exe` 无 PDB 且不导出 C++ 游戏符号，因此采用
 | `armor_max` | `NShipUtil::CalcMaxArmorHitPoints` | `0x00BB5CD0` | EXACT | 同上，忠实重算 + 塌 0 / 负值封顶 |
 | `hull_max` | `NShipUtil::CalcMaxHitPoints` | `0x00BB4A60` | EXACT | 近似重算（未建模三段条件加法，方向安全）+ 负值封顶 |
 | `damage_per_day` | `NShipUtil::CalcAverageDamagePerDay` | `0x00BB7D70` | EXACT | 舰船详情面板「伤害」负值/越界封顶（**仅影响 UI 显示，不影响实战伤害**） |
-| `ship_size_max_hp` | `CShipSize::PostReadInit()` | `0x00E42660` | EXACT\* | `max_hitpoints` 源头负值兜底；**⚠️ 4.6.0 暂以 `kShipSizeWriteEnabled=false` 仅观测不回写，待活体复核 `+0x6b8`** |
+| `ship_size_max_hp` | `CShipSize::PostReadInit()` | `0x00E42660` | EXACT | `max_hitpoints` 源头负值兜底；**4.6.0 偏移已活体复核为 `+0x6f0`，回写已恢复（仅负值触发，正常正值一律不动）** |
 | `cfx_sqrt` | `CFixedPoint::Sqrt() const` | `0x01CFBC90` | INPUT_GUARD | 负输入在原实现会被当作极大无符号数迭代；检测并夹取 |
 | `cfx_safe_sqrt` | `CFixedPoint::SafeSqrt() const` | `0x01CFF8F0` | OBSERVE | 记录负输入；ABI `(src=rcx, out=rdx)` |
 | `cfx_round_to` | `CFixedPoint::RoundTo(CFixedPoint const&)` | `0x01CFF4A0` | OBSERVE | 记录 `divisor==0` 与 `v + divisor/2` 溢出 |
 | `cfx_atan2` | `CFixedPoint::Atan2(...)` | `0x01CFF5C0` | OBSERVE | 记录参数平方越界量级 |
 | `cfx_get_rounded_fp15` | `CFixedPoint::GetRounded(fpml<...,15> const&)` | `0x01CFF3C0` | OBSERVE | ABI `(out=rcx, src=rdx)`；4.6.0 起游戏自身已加入饱和钳位 |
-| `var_multiply` | `CMultiplyVariableEffect::ExecuteActual` | `0x018E8E40` | OBSERVE | **⚠️ 4.6.0 改 token 哈希表，`kVarShadowSupported=false`，当前仅计数** |
-| `var_add` | `CAddVariableEffect::ExecuteActual` | `0x018E83D0` | OBSERVE | 同上，当前仅计数 |
+| `var_multiply` | `CMultiplyVariableEffect::ExecuteActual` | `0x018E8E40` | EXACT | **4.6 token 链已适配：忠实复算并比对；mismatch 即游戏 64 位算错，回写精确饱和值（`v1!=sat` 已证明完备无假阳）** |
+| `var_add` | `CAddVariableEffect::ExecuteActual` | `0x018E83D0` | EXACT | 同上（`cfx::add`），忠实复算 + 回写饱和值 |
 | `diplo_weight` | `CPopJob::CalcDiplomaticWeight` | `0x00916BA0` | OBSERVE | 记录负值或极端越界的外交权重 |
 | `mpe15` | `NCombatRules::CalcMilitaryPowerExponent<15>` | `0x00BAE130` | OBSERVE | 舰队实力指数（fp15），ABI `(out, base, exp)`；记录中间积风险 |
 | `mpe7` | `NCombatRules::CalcMilitaryPowerExponent<7>` | `0x00BAE2A0` | OBSERVE | 舰队实力指数（fp7），同上 |
@@ -147,11 +147,15 @@ sat    = cfx::mul(base, factor)   // 128 位饱和乘法
 
 - **`damage_per_day`**：拦截 `NShipUtil::CalcAverageDamagePerDay` 的 sret 返回槽；伤害总计不可能为负，检出负值或越过上限即封顶为 `INT64_MAX`。经调用图核实，全部 8 个调用者均属 UI/工具提示层，只修正界面显示，不影响战斗伤害结算。
 - **`ship_size_max_hp`**：拦截 `CShipSize::PostReadInit()`，在 mod 加载 `ship_sizes/*.txt` 阶段从源头拦截 `max_hitpoints` 的 wrap 负值（否则污染 `design + 0x10` 后下游重算会产生「同向错」）。
-  - ⚠️ **4.6.0 临时状态**：偏移 `0x6b8` 系在 4.5.2 / 4.5.3 上用 HULLMAP 探针实测得出；4.6.0 尚未复核结构布局，源码中 `kShipSizeWriteEnabled = false`，当前只检出记 EVENT 而不写入。复核方式：将 `config\satfix.ini` 的 `diag_recompute_calls` 设为正数，进游戏查看舰船设计/详情，确认日志中 `DIAG HULLMAP ... 命中偏移:` 仍为 `6b8` 后即可重新启用回写。
+  - ✅ **4.6.0 偏移已复核**：4.5.3 的 `+0x6b8` 在 4.6.0 已失效。实机对 320 个 `CShipSize` 对象做「已知脚本船体值反扫」，唯一同时命中全部 11 个基础值（`@transport_hp=100` … `@juggernaut_hp=100000`）的槽位是 `+0x6f0`；`+0x6b8` 上是 0/0.75/1.0/1.5 之类小数（别的字段）。源码已改为 `kShipSizeMaxHpOff=0x6f0` 且 `kShipSizeWriteEnabled=true`，回写恢复，仍受「仅负值触发」硬闸门保护。
 
-### 4.3 4.6.0 主动停用变量影子复算
+### 4.3 4.6.0 变量链已适配 token 键控（检测 + 回写）
 
-4.6.0 将脚本变量存储改为 token 键控哈希表，`AccessVariablePointer` 第二参由 `CString const*` 变为 `uint16` token，旧的四步读回链会产生非法指针风险。因此源码中 `kVarShadowSupported = false`，`var_multiply` / `var_add` 目前仅做调用计数（即使配置里打开 `verify_variables` 也不会启用）。
+4.6.0 将脚本变量存储改为 token 键控哈希表：token 内联在效果对象 `this+0xc0`（Windows；Linux 0xb8），经 `AccessVariablePointer(scope, token)` 取容器，再用 `CPdxUnorderedMap::FindGet(容器, token)`（0x0088D120）读值（指针处即 CFixedPoint）、`0x0088D260` 写回；操作数为 `CFixedPointVariableValue::GetValue(this+0x298, scope)`。`access_var_pointer`、`cvars_findget`、`cvars_set`、`cfp_getvalue` 四个 helper 的 RVA 与 ABI 均已由 4.6 Windows 反汇编确证并接入。
+
+源码 `kVarShadowSupported = true`：`var_multiply` / `var_add` 现在做**忠实影子复算**（读 v0、操作数 d，调原函数后读回 v1，与 `cfx::add/mul` 比对，不一致记 EVENT）。实机样本 `v0=200000 d=100000 game=300000 sat=300000 一致` 证明读链正确、零崩溃。
+
+**已回写**（`kVarWriteEnabled = true`）：判据 `v1 != sat` 被证明**完备且无假阳**——`cfx::mul / cfx::add` 是精确饱和运算（800 万组含 INT64 极值随机对拍，与「128 位真值向零截断再夹到 int64」逐位相等、0 反例）；而游戏的 64 位游戏乘法 `mul_game` 只在**它自己算错**时才 ≠ 精确值（真值越界，或拆分中间量 `(X%1e5)*Y` 在 |操作数|≳9e8 时溢出）。所以 mismatch ⇒ 游戏算错 ⇒ 写回精确饱和值一定是**修复**；合法负值只要不越界就精确相等、不触发。与船体/护盾同一套「忠实重算 + 越界兜底」。
 
 ---
 
@@ -167,7 +171,7 @@ sat    = cfx::mul(base, factor)   // 128 位饱和乘法
 | `heartbeat_every` | `200000` | 每累计 N 次 hook 调用打印一次分类计数 |
 | `max_hp_cap` | `1000000000000000000` | 退化路径下的上限阈值（CFixedPoint 存储值，`1e18` ≈ `1e13` 游戏单位） |
 | `verify_max_hp` | `true` | 开启护盾/装甲/船体上限重算与塌 0 兜底；设为 `false` 退化为仅检负值 |
-| `verify_variables` | `false` | 变量系统影子复算开关（4.6.0 源码 `kVarShadowSupported=false` 已强制停用） |
+| `verify_variables` | `true` | 变量系统忠实复算开关（4.6 token 链已适配：检测 + 回写饱和值；变量效果调用很少，开销可忽略，默认开） |
 | `diag_recompute_calls` | `0` | 诊断开关：打印前 N 次上限重算中间量与 HULLMAP 偏移扫描（**会绕过早退热路径，排查完请改回 0**） |
 | `diag_modifier_calls` | `0` | 诊断开关：统计 `ApplyModifierMult` 的 ModifierType 直方图（有逐调用原子加开销，默认关） |
 | `log_recompute_mismatch` | `false` | 记录「重算 ≠ 游戏但未触达回写闸门」的 NOTE 日志（默认关） |
@@ -269,9 +273,9 @@ python tools\gen_targets_win.py --check
 
 ## 9. 当前已知限制
 
-1. **4.6.0 两项主动降级**：
-   - `ship_size_max_hp` 的 `CShipSize + 0x6b8` 偏移尚未在 4.6.0 上活体复核，当前版本暂不回写（`kShipSizeWriteEnabled = false`）；
-   - `var_multiply` / `var_add` 因 4.6.0 变量表重构为 token 哈希表，当前停用影子复算（`kVarShadowSupported = false`）。
+1. **4.6.0 两项降级已处理**（原 0.5.0 的主动降级）：
+   - `ship_size_max_hp`：`CShipSize` 的 `max_hitpoints` 偏移经实机反扫复核为 `+0x6f0`（4.5.3 的 `+0x6b8` 在 4.6.0 已失效），回写已恢复（`kShipSizeWriteEnabled = true`，仅负值触发）；
+   - `var_multiply` / `var_add`：4.6 token 键控链已适配，`kVarShadowSupported = true` 恢复忠实复算，`kVarWriteEnabled = true` 回写饱和值；判据 `v1!=sat` 经 800 万组对拍证明完备无假阳（见 §4.3）。
 2. **上限重算建模边界**：
    - 护盾/装甲的条件性船级修正（`0x1d4/0x1d5`、`0x1d2/0x1d3`）因依赖 `CFleet` 领土状态而采用乐观累加，由保守回写闸门兜底不误改；
    - 船体上限未建模三段条件性加法修正，重算偏小但方向安全；理论上若存在「未死舰船且真值为负」的极端情况会出现 `sat != v && v < 0` 窗口，按实机裁定暂不额外收紧（详析见 [`docs/ENGINEERING_NOTES.md`](docs/ENGINEERING_NOTES.md)）。
