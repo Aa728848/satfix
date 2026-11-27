@@ -559,6 +559,169 @@ CONFIRMED: list[tuple[str, str, int, str, str]] = [
 # 明确列出来而不是假装支持：插件会在启动日志里报告"未定位 N 个"，
 # 后续用同样流程（win_fingerprint.py 出候选 -> 读函数体确证）逐个补。
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4.6 重定位（2026-11：Cygnus v4.6.0，exe build 0x6AF6BDEC）
+#
+# 用**覆盖表**而不是就地改上面的元组，理由有两个：
+#   1) 上面那份 4.5.3 的 RVA 与证据是历史记录，出问题要能回看；
+#   2) 覆盖表一眼能看出「本轮到底改了哪些地址」。
+#
+# 方法（本轮实际用到，按可靠性排序）：
+#   a) 掩码字节比对：把 4.5.3 的函数体字节从 Ghidra 工程 stellaris-c453 取出
+#      （tools/relocate/probe_old_bytes_453.py），把 call/jmp 的 rel32 与
+#      rip-relative 的 disp32 打成通配，再扫新 exe 的 .text（scan_in_new_exe.py）。
+#   b) 立即数「落进某个寄存器」检索：ModifierType 是第 4 个参数走 r9d，于是
+#      mov r9d,<type_add> 与 mov r9d,<type_mul> 同时出现就是强指纹
+#      （locate46.py scan-imm-fn）。三个上限函数靠这一条在全库唯一命中。
+#   c) 独占字符串 / 8 位行号常量：ship_size_max_hp 靠 Linux 4.6 的三条报错串。
+#   d) .pdata 分块形状：diplo_weight 的 43/74/524/5/20 五块与旧版逐块相同。
+#
+# 4.6 的 ModifierType 枚举整体位移（hull 0x1e/0x1f -> 0x20/0x21 等），
+# 所以**不能**拿 4.5.3 的编号当 4.6 的判据 —— 一律从 4.6 Linux 反编译重读。
+# ---------------------------------------------------------------------------
+RVA_46: dict[str, int] = {
+    "cfx_get_rounded":        0x01CFF460,
+    "cfx_to_fp15":            0x01CFF360,
+    "cfx_get_rounded_fp15":   0x01CFF3C0,
+    "cfx_round_to":           0x01CFF4A0,
+    "cfx_atan2":              0x01CFF5C0,
+    "cfx_sqrt":               0x01CFBC90,
+    "cfx_safe_sqrt":          0x01CFF8F0,
+    "apply_mul_cfx":          0x004025F0,
+    "apply_mul_fp15":         0x00402730,
+    "var_multiply":           0x018E8E40,
+    "var_add":                0x018E83D0,
+    "mpe15":                  0x00BAE130,
+    "mpe7":                   0x00BAE2A0,
+    "hull_max":               0x00BB4A60,
+    "shield_max":             0x00BB52E0,
+    "armor_max":              0x00BB5CD0,
+    "damage_per_day":         0x00BB7D70,
+    "diplo_weight":           0x00916BA0,
+    "ship_size_max_hp":       0x00E42660,
+    "access_var_pointer":     0x00B00910,
+    "cvars_get":              0x00295C10,
+    "cvars_set":              0x0088D260,
+    "cfp_getvalue":           0x003E3CF0,
+    "ship_size_of":           0x003AEA80,
+    "modifier_value":         0x00E40D40,
+}
+
+EVIDENCE_46: dict[str, str] = {
+    "cfx_get_rounded":
+        "【4.6 重定位】掩码字节全等，全 .text 唯一命中（保留字节 49/49）；叶子函数无 .pdata（预期）。"
+        "位移 +0x1AE780。新址 0x01CFF460。",
+    "cfx_to_fp15":
+        "【4.6 重定位】掩码字节全等，唯一命中（87/87）。位移 +0x1AE750。新址 0x01CFF360。",
+    "cfx_get_rounded_fp15":
+        "【4.6 重定位】字节变了，改按常量+结构定：新址 0x01CFF3C0。"
+        "证据一（常量）：体内同时有 0x7fff / 0xf / 0xc3500000 / 0x4000 / 0x186a0，以及 "
+        "cqo + and edx,0x7fff + add + sar 0xf 的「加半个再取整」技巧 —— 与 4.5.3 本函数的指纹逐个对上。"
+        "证据二（簇间距）：它紧跟 cfx_to_fp15（0x01CFF360，已确证）之后 +0x60，"
+        "与 4.5.3 里两者的间距 0x60 完全一致；再往后 +0xA0 就是 cfx_get_rounded(0x01CFF460)。"
+        "证据三（ABI 不变）：mov r8,rcx / mov rcx,[rdx] ... mov [r8],rax / mov rax,r8 —— sret 两参，"
+        "rcx=输出槽、rdx=输入，与 v0.4.1 勘误后的签名一致。"
+        "★ 行为变化：4.6 给这个换算加了饱和钳位（上界 0xa7c5ac47、下界 0xffffffff583a53b9，"
+        "越界直接写 0xffffffffffff / 0xffff000000000001）。游戏侧这一步已经自愈 —— "
+        "插件在这里的判据要按「游戏已经会饱和」来读，别把钳位当成新的溢出证据。",
+    "cfx_round_to":
+        "【4.6 重定位】掩码字节全等，唯一命中；.pdata 起点长度 282 与旧 282 完全相同。新址 0x01CFF4A0。",
+    "cfx_atan2":
+        "【4.6 重定位】掩码字节全等（810B），唯一命中；.pdata 首块 8B 与旧记录「8/543/9/250」一致。"
+        "新址 0x01CFF5C0。",
+    "cfx_sqrt":
+        "【4.6 重定位】掩码字节全等，唯一命中；.pdata 起点长度 686 与旧 686 相同。位移 +0x1AE750。新址 0x01CFBC90。",
+    "cfx_safe_sqrt":
+        "【4.6 重定位】掩码字节全等，唯一命中；.pdata 起点长度 573 与旧 573 相同。新址 0x01CFF8F0。",
+    "apply_mul_cfx":
+        "【4.6 重定位】新址 0x004025F0（横跨 3 个连续 .pdata 块：76 + 88 + 153 = 317 字节，旧 286；"
+        "增量来自 4.6 把 fp15 归约内联进来）。判据仍是调用者法：STARBASE_CAPACITY_MAX_REACHED 唯一命中"
+        "函数 0x0080C1F0（CCountry::CalcStarbaseCapacity，3468 字节），它在 0x0080CDB1 / 0x0080CE3F"
+        "两次 call 本函数 —— 与 4.5.3 的定位路径完全同构。体形旁证：类型表查找 mov rdi,[DAT+type*0xb0+0xa0]、"
+        "bool 分支对倍率 ±100000、(v*m)/100000 的安全域判定 + ÷100000 魔数 0x29f16b11c6d1e109、"
+        "就地写 [rsi] 且 sret 写返回槽。ABI（调用点 0x0080CD90 起实证）：lea rcx,[rbp+0x148]=返回槽、"
+        "lea rdx,[rbp+0x140]=被就地改写的值、mov r8,rdi=CModifier*、mov r9d,0xf7=ModifierType、"
+        "mov byte[rsp+0x20],0=第 5 个 bool（栈）—— 与 4.5.3 一致。"
+        "排他：0x002D3750 是它内部用的类型表查找助手（无乘法、无 sret、无就地写）。",
+    "apply_mul_fp15":
+        "【4.6 重定位】新址 0x00402730（单块 .pdata，222 字节，旧 206）。与 cfx 重载紧邻（0x4025F0 结束于"
+        "0x40272D，间隔 3 字节对齐），顺序与 4.5.3 一致（cfx 在前更长）。判据：体内内联了 cfx_to_fp15 的归约"
+        "（0x29f16b11c6d1e109 >> 0xe、×0x40000000/0xc3500000、<<0xf、0x186a0），再 imul [rsi] / sar rdx,0xf /"
+        "写回 [rsi]，sret 写 [rdi]=实际倍率；本重载没有 bool 分支（与 4.5.3 相同）。"
+        "ABI（调用点 0x0108EC9D / 0x0109A080 实证）：rcx=返回槽、rdx=被就地改写的 fp15 引用、"
+        "r8=CModifier*（[rbp+0x160]+0x3630 子对象）、r9d=ModifierType（从 moddef+0x970 的 +0x80 读出）；"
+        "调用后 add rsi,[rbp+0x168] 确证就地改写。",
+    "var_multiply":
+        "【4.6 重定位】新址 0x018E8E40（683 字节，旧 604，.pdata start=True）。判据：独占诊断串"
+        " multiply_variable: variable ... is not set for scoped ...（VA 0x026B6FB0）在 exe 里唯一命中，"
+        "唯一引用点落在本函数（0x018E8F88）；13 个直接 call 与 4.6 Linux CMultiplyVariableEffect::ExecuteActual 同构。"
+        "★ 4.6 的变量存储换成了 token 键控哈希表：读值走 0x0088D120、写回 0x0088D260、取值 0x00B00910，"
+        "旧的 CVariables::GetVariable/SetVariable 已不在该链上 —— 因此本目标的影子复算已在插件里停用"
+        "（kVarShadowSupported=false），只保留计数。ABI：void fn(this=rcx, scope=rdx)，未变。",
+    "var_add":
+        "【4.6 重定位】新址 0x018E83D0（233 字节，旧 137，.pdata start=True）。与 var_multiply 共被调集合"
+        "（0xB00910 / 0x88D120 / 0x3E3CF0 / 0x88D260），写回是 add r8,[rdi]（GetValue + 当前值，纯加法），"
+        "且体内没有乘法安全界常量 —— 与 CAddVariableEffect 一致。排他：同簇 0x018E8A90 是减法（sub [rdi],val）、"
+        "0x018E99D0 含 idiv（取模）、0x018E9F00 调 0x1CFF4A0（除法路径）。ABI：void fn(this=rcx, scope=rdx)。",
+    "access_var_pointer":
+        "【4.6 重定位】新址 0x00B00910（234 字节，旧 205，.pdata start=True）。判据：每个 var_* 的首个 call"
+        "（var_multiply 0x018E8EC3 / var_add 0x018E8450），体内建 local_ 前缀（len 6）+ 三分支 CEventScope，"
+        "与 4.5.3 同构。⚠ ABI 变了：第二参从 CString const* 变成 uint16 token，三参并两参 ——"
+        "long long fn(scope=rcx, token=edx)。插件目前不再调用它（影子复算停用）。",
+    "cvars_set":
+        "【4.6 重定位】新址 0x0088D260（97 字节，旧 108，.pdata start=True）。判据：每个 var_* 的末位写回 call"
+        "（var_multiply 0x018E90CE / var_add 0x018E849C）；体内 FNV（0x811c9dc5 / 0x1000193）+ Emplace +"
+        "写 entry+0x10，与 0x0088D120 读 +0x10 互证。⚠ ABI 变了：void fn(vars=rcx, token=edx, value=r8)。"
+        "插件目前不再调用它。",
+    "cfp_getvalue":
+        "【4.6 重定位】新址 0x003E3CF0（2077 字节，旧 1470，.pdata start=True）。判据：体内大 switch 的魔数集合"
+        "（0x3216 / 0x2bef 等约 150 个字面量）与 4.6 Linux CFixedPointVariableValue::GetValue 吻合；"
+        "var_multiply 在 0x018E8486 一带以 this+0x298 为第一参调用它。长度增加来自新增的 token-map 分支。"
+        "插件目前不再调用它。",
+    "hull_max":
+        "【4.6 重定位】新址 0x00BB4A60（长度 2171，.pdata start=True）。判据是 ModifierType 立即数对："
+        "加算 0x20、乘算 0x21 都以 mov r9d,imm 喂给 GetModifierValue(0x140E40D40)，这两个数字同时出现在"
+        "同一个函数里的情况，在 4.6 的 142,256 个 .pdata 函数中唯一。旁证：船级表 lea rax,[rip+0x1E76D90]"
+        " -> 0x2A2BCA4，movzx ebx,byte[r12+0x468] 取等级；同时调用 ship_size_of 与 modifier_value。"
+        "ABI 由调用点 0x00BAD340 确证：lea rcx,[rsp+0xa0]=sret 返回槽、rdx=design、r8=mods、r9=fleet、"
+        "[rsp+0x20]=tooltip(传 0)，与 4.5.3 完全一致。体积从 2784 降到 2171 是因为 4.6 把 tooltip 分支拆出去了。",
+    "shield_max":
+        "【4.6 重定位】新址 0x00BB52E0（长度 2535，.pdata start=True）。判据同 hull：加算 0x30、乘算 0x31 的"
+        "mov r9d,imm 对在全库唯一；船级对 0x1d4/0x1d5 也在体内（仍在「友方领土」分支里）；船级表 -> 0x2A2BD1C。"
+        "ABI 同 hull（sret：rcx=返回槽, rdx=design, r8=mods, r9=fleet, 栈=tooltip）。",
+    "armor_max":
+        "【4.6 重定位】新址 0x00BB5CD0（长度 2295，.pdata start=True）。判据同 hull：加算 0x26、乘算 0x27 的"
+        "mov r9d,imm 对在全库唯一；船级对 0x1d2/0x1d3；船级表 -> 0x2A2BCE0。ABI 同 hull。",
+    "damage_per_day":
+        "【4.6 重定位】新址 0x00BB7D70（长度 3721，.pdata start=True，旧 4336 同量级）。判据仍是 ModifierType"
+        "序列，但数字必须从 4.6 Linux 体重读：4.6 是 0x3c / 0x43 / 0x170 / 0x44 / 0x1df / 0x1de / 0x23f"
+        "（4.5.3 是 0x3a/0x40/0x168/0x41/0x1d2/0x1d3/0x230），以 r9d 按同序喂给 GetModifierValue(0x140E40D40)；"
+        "全库能同时命中 7/7 的只有本函数（次优 0x00727DAC 只中 6/7，缺 0x3c，上下文是数组遍历，排除）。"
+        "旁证：独占安全界常量由 0xb50679d3 变为 0xb504f333（与 4.6 Linux 一致）；片区上紧跟三个上限函数。"
+        "ABI：sret，rcx=返回槽（写回 *ret 即面板值），调用点 0x00BAD584 调用后立即 mov rcx,[rsp+0xa0] 把结果"
+        "当值继续算，证明 rcx 是独占返回槽。★ 4.5.3 那个「按 0xb50679d3 全库搜」的坑不要重走。",
+    "diplo_weight":
+        "【4.6 重定位】新址 0x00916BA0。证据一：掩码字节一致率 0.9952（620/623），差异只在收尾的寄存器分配。"
+        "证据二：.pdata 把整段切成 43 + 74 + 524 + 5 + 20 = 666 五块，与 4.5.3 记录的分块逐块相同。",
+    "ship_size_max_hp":
+        "【4.6 重定位】新址 0x00E42660（长度 2172，.pdata start=True，旧 1870 同量级）。判据是三条独占报错串"
+        "（从 4.6 Linux CShipSize::PostReadInit 抄）：upgrade size not found in database / "
+        "use_ai_design_role_from: invalid ship size / invalid component set —— 各自 find-str 唯一命中，"
+        "xref 全落本函数（例：引用点 0x00E42BEA）。旁证：8 位行号常量 0x54f/0x55e/0x56d 与 Linux 一致；"
+        "序言 movzx eax,[rcx+0x9f8] + cmp al,0xa 对应 Linux this[0x9b8]==0xa（+0x40 子对象错位）。"
+        "ABI（三个调用点实证，均只传一个指针）：0x002B1BA6 / 0x002B1D20 / 0x00E43710 —— void fn(void* self)，"
+        "rcx=this。⚠ 结构偏移 0x6b8 必须在 4.6 上活体重新确证（随构建用活体探针扫值相等槽位复核）。",
+    "cvars_get":
+        "【4.6 重定位】掩码字节全等，唯一命中；.pdata 起点长度 217 与旧 217 相同。位移 +0x6E950。新址 0x00295C10。"
+        "注意：4.6 的变量效果链已不再调用它（改走 token 键控哈希表），它只是同码仍在。",
+    "ship_size_of":
+        "【4.6 重定位】掩码字节全等，唯一命中；长度 69 与旧 69 相同。位移 +0x9F750。新址 0x003AEA80。",
+    "modifier_value":
+        "【4.6 重定位】掩码字节全等，唯一命中；长度 312 与旧 312 相同。位移 +0x111BE0。新址 0x00E40D40。"
+        "★ 配套改动：体内的 ModifierType 元数据表在 4.6 改成「先取全局指针再索引」—— 0xE40D64 "
+        "mov r15,qword ptr [rip+0x1BE8F85]（指针变量 RVA 0x2A29CF0，静态映像里为 0，启动后才填），随后 "
+        "imul rcx,rax,0xb0 + mov eax,[rcx+r15+0xa8] + shr eax,5 + test al,1。插件侧已改为运行时解引用该指针。",
+}
 UNRESOLVED: list[tuple[str, str, str]] = [
     ("cfx_safe_sqrt_int", "CFixedPoint::SafeSqrt(long long)  —— **已判定：Windows 侧无对应代码，非缺口**",
      "**结论（有证据，不是推测）**：MSVC 不生成这个重载，所以 Linux 那条 INPUT_GUARD 在 Windows 上没有可挂的对象。"
@@ -781,6 +944,8 @@ def build(exe: Path) -> str:
     arrays = []
     rows = []
     for key, desc, rva, strat, ev in CONFIRMED:
+        rva = RVA_46.get(key, rva)
+        ev = EVIDENCE_46.get(key, "") + ev
         sig = read_sig(pe, rva)
         arrays.append(f"inline const uint8_t kSig_{key}[SATFIX_WIN_SIG_LEN] = "
                       f"{{ {c_bytes(sig)} }};")
@@ -793,6 +958,8 @@ def build(exe: Path) -> str:
 
     helper_rows = []
     for key, desc, rva, ev in HELPERS:
+        rva = RVA_46.get(key, rva)
+        ev = EVIDENCE_46.get(key, "") + ev
         sig = read_sig(pe, rva)
         arrays.append(f"inline const uint8_t kSig_{key}[SATFIX_WIN_SIG_LEN] = "
                       f"{{ {c_bytes(sig)} }};")

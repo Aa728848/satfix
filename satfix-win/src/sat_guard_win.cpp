@@ -619,6 +619,19 @@ extern "C" long long* detour_to_fp15(const long long* src, long long* ret_slot) 
 //      4. 读回 v1，与 cfx::add / cfx::mul 的饱和结果比对
 //  REPLACE=1 时第 4 步用 SetVariable 把饱和值写回去。
 // ===========================================================================
+/// 【4.6 关键限制】变量系统的读回链在 4.6 上**已经不成立**，所以整套影子复算被停用。
+///
+/// 4.6 把变量存储改成了 token 键控的 CPdxUnorderedMap：
+///   * 取变量作用域：0x00B00910，签名变成 `long long fn(scope, uint16 token)`
+///     —— 4.5.3 是 `fn(scope, CString const*)`，**第二参从字符串指针变成了 16 位 token**；
+///   * 读值/写回也不再走 CVariables::GetVariable/SetVariable，而是 0x0088D120 / 0x0088D260
+///     （FNV 哈希查表，值在条目 +0x10，不是旧的 +0x38）。
+/// 也就是说旧的四步链（access → get → 调原函数 → 读回）在 4.6 上会**用字符串指针当 token 传**，
+/// 属于「拿指针去查表」，是实打实的崩溃风险。而 var_multiply / var_add 本来就只是 OBSERVE（只计数），
+/// 所以这里**直接停用影子复算**：钩子照常计数，不做任何读回、不复算、不回写。
+/// 要恢复需要先重新确证 token 的来路（CString → token 的映射函数）与条目 +0x10 的读法，另行验证。
+constexpr bool kVarShadowSupported = false;
+
 using FnAccessVarPtr = long long (*)(const void* scope, const void* name);
 using FnGetVariable  = long long* (*)(const void* vars8, long long* out, const void* name);
 using FnSetVariable  = void (*)(const void* vars, const void* name, long long value);
@@ -728,7 +741,7 @@ extern "C" void detour_var_mul(const void* self, const void* scope) {
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
     note_first_call(idx);
     game_thread_pump();
-    if (g_settings.enabled && g_settings.verify_variables)
+    if (g_settings.enabled && g_settings.verify_variables && kVarShadowSupported)
         shadow_variable("multiply_variable", "mul", self, scope, g_hook_var_mul);
     else
         g_hook_var_mul.call(self, scope);
@@ -745,7 +758,7 @@ extern "C" void detour_var_add(const void* self, const void* scope) {
     g_fn_calls[idx].fetch_add(1, std::memory_order_relaxed);
     note_first_call(idx);
     game_thread_pump();
-    if (g_settings.enabled && g_settings.verify_variables)
+    if (g_settings.enabled && g_settings.verify_variables && kVarShadowSupported)
         shadow_variable("add_variable", "add", self, scope, g_hook_var_add);
     else
         g_hook_var_add.call(self, scope);
@@ -1203,18 +1216,32 @@ struct MaxHpRecipe {
 /// **与 modifier_value 的区别**：这里是**内联**展开，结尾**不做**
 /// `FUN_140d2c080(size, type)` 那一项相加（那一步只出现在 FUN_140d29dd0 里）。
 /// 所以不能直接复用 modifier_value，必须自己扫表。
-constexpr uint32_t kClassTableShield = 0x28167acu;
-constexpr uint32_t kClassTableArmor  = 0x2816774u;
-constexpr uint32_t kClassTableHull   = 0x281673cu;
+/// 【4.6 重定位】三张表都在 .data，静态映像里**全是 0**（ModifierType 编号是启动期填的），
+/// 运行时才有效 —— 与 4.5.3 一样按 RVA 取地址、运行时读值。
+/// 相对位置关系与 4.5.3 完全一致（hull < armor < shield，间隔 0x3c = 15 项；
+/// 4.5.3 是 0x38 = 14 项 —— 4.6 多了一个舰船等级）。指令证据：
+///   hull   0xBB4F0D `lea rax,[rip+0x1E76D90]` -> 0x2A2BCA4
+///   armor  0xBB617E `lea rax,[rip+0x1E75B5B]` -> 0x2A2BCE0
+///   shield 0xBB574C `lea rax,[rip+0x1E765C9]` -> 0x2A2BD1C
+constexpr uint32_t kClassTableShield = 0x2A2BD1Cu;
+constexpr uint32_t kClassTableArmor  = 0x2A2BCE0u;
+constexpr uint32_t kClassTableHull   = 0x2A2BCA4u;
 /// 舰船等级下标在 design 里的偏移（三个函数都用 0x468）。
 constexpr int64_t kShipClassOff = 0x468;
 
-constexpr MaxHpRecipe kRecipeShield = {0x130, 0x2e, 0x2f, 0x1c8, 0x1c9, true,
+/// 【4.6 重定位】ModifierType 枚举整体位移，四个数字全部从 4.6 Linux 函数体
+/// 重读并用 Windows 机器码交叉确证（hull 0xBB4A60 / shield 0xBB52E0 / armor 0xBB5CD0）：
+///   hull   加算 0x1e -> 0x20，乘算 0x1f -> 0x21（另见 0xBB4F59 的 0x1d6/0x1d7 条件对）
+///   shield 加算 0x2e -> 0x30，乘算 0x2f -> 0x31；船级对 0x1c8/0x1c9 -> 0x1d4/0x1d5
+///   armor  加算 0x24 -> 0x26，乘算 0x25 -> 0x27；船级对 0x1c6/0x1c7 -> 0x1d2/0x1d3
+/// 判据：`mov r9d,<type_add>` 与 `mov r9d,<type_mul>` 在同一函数里同时出现，
+/// 在 4.6 的 142,256 个 .pdata 函数里**唯一**。
+constexpr MaxHpRecipe kRecipeShield = {0x130, 0x30, 0x31, 0x1d4, 0x1d5, true,
                                        kClassTableShield};
-constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x24, 0x25, 0x1c6, 0x1c7, true, kClassTableArmor};
+constexpr MaxHpRecipe kRecipeArmor  = {0x70, 0x26, 0x27, 0x1d2, 0x1d3, true, kClassTableArmor};
 // 船体：add_carries_value = false —— 它的 add_in 正常就是 0，不能当溢出判据。
 // 它的溢出走另一条路（base 非 0，乘爆后 wrap），由下面的 `v < 0` 那条分支兜。
-constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x1e, 0x1f, 0, 0, false, kClassTableHull};
+constexpr MaxHpRecipe kRecipeHull   = {0x10, 0x20, 0x21, 0, 0, false, kClassTableHull};
 
 /// 用游戏自己的原语饱和重算上限。成功返回 true 并把结果写进 `*out`。
 /// 任一原语没解析到（辅助函数签名校验失败）就返回 false，调用方退化成「只认负数」。
@@ -1291,6 +1318,24 @@ inline bool is_hp_modifier_type(int t) {
 ///
 /// 内联版「按类型取值」：扫 mods 的 type 数组，命中就取对应值并按掩码夹取。
 /// 不做 FUN_140d2c080 的相加（与游戏内联形态一致）。
+/// ModifierType 元数据表的**指针变量**（不是表本身）。
+///
+/// 4.5.3 的表地址是直接写在指令里的常量（`*(DAT_142814390 + type*0xb0 + 0xa8)`），
+/// 4.6 改成了「先取全局指针、再按 0xb0 步长索引」（modifier_value 0xE40D40 体内，
+/// 0xE40D64 处）：
+///     mov r15, qword ptr [rip+0x1be8f85]    ; r15 = *(VA 0x142A29CF0)
+///     imul rcx, rax, 0xb0
+///     mov eax, dword ptr [rcx + r15 + 0xa8]
+/// 所以这里必须**运行时解引用**：静态映像里那 8 字节是 0，是启动之后才填进去的。
+/// 读不到（或还没填）就退回「不做 clamp」——与 4.5.3 表地址解析失败时的行为一致。
+constexpr uint32_t kModMetaPtrRva = 0x2A29CF0u;
+
+const void* modifier_meta_table() {
+    const void* p = nullptr;
+    if (!whk::safe_read(&p, whk::image_base_plus(kModMetaPtrRva), sizeof p)) return nullptr;
+    return p;
+}
+
 int64_t inline_mod_lookup(const void* mods, int type) {
     if (mods == nullptr) return 0;
     const char* m = static_cast<const char*>(mods);
@@ -1307,7 +1352,7 @@ int64_t inline_mod_lookup(const void* mods, int type) {
         if (t != type) continue;
         int64_t v = 0;
         if (!whk::fast_read(&v, static_cast<const char*>(vals) + (size_t)i * 0x10, sizeof v)) return 0;
-        void* tbl = whk::image_base_plus(0x2814390u);  // ModifierType 元数据表
+        const void* tbl = modifier_meta_table();
         if (tbl != nullptr) {
             uint32_t mask = 0;
             if (whk::fast_read(&mask, static_cast<const char*>(tbl) + (size_t)type * 0xb0 + 0xa8,
@@ -1807,6 +1852,14 @@ extern "C" long long* detour_hull_max(long long* ret, const void* design, const 
 //  另注：Windows 的 CShipSize 大小是 0xee8（Linux 是 0xe88），差 0x60。
 constexpr int64_t kShipSizeMaxHpOff = 0x6b8;
 
+/// 【4.6 安全闸】偏移 0x6b8 是**在 4.5.3 上**用 HULLMAP 探针实测出来的（见上）。
+/// 4.6 的 CShipSize 是否又变长，本轮**没有**活体复核过 —— 而「写错偏移」等于把
+/// INT64_MAX 写进别的字段，是存档损坏级别的风险（手册 6.4：偏移必须在本平台重新确证）。
+/// 所以 0.5.0 先只观测：钩子照常装、照常计数、检出负值照样写 EVENT，但**不回写**。
+/// 复核方法（与 4.5.3 相同）：把 diag_recompute_calls 设成 >0，进游戏打开一次舰船设计/舰队
+/// 详情，看日志里的 `DIAG HULLMAP ... 命中偏移:` —— 若仍是 6b8，把这里改成 true 即可。
+constexpr bool kShipSizeWriteEnabled = false;
+
 whk::TypedHook<void (*)(void*)> g_hook_ship_size_max_hp;
 
 extern "C" void detour_ship_size_post_read_init(void* self) {
@@ -1841,12 +1894,13 @@ extern "C" void detour_ship_size_post_read_init(void* self) {
              (long long)v, static_cast<double>(v) / 1e5, (long long)kSaturateCap,
              static_cast<double>(kSaturateCap) / 1e5,
 #if SATFIX_REPLACE
-             " [已回写]"
+             kShipSizeWriteEnabled ? " [已回写]" : " [4.6 偏移待复核，未回写]"
 #else
              " [影子模式，未改数值]"
 #endif
         );
 #if SATFIX_REPLACE
+    if (!kShipSizeWriteEnabled) return;  // 4.6：偏移未经活体复核前绝不回写
     g_replaced.fetch_add(1, std::memory_order_relaxed);
     // 直接写：与 detour_max_hp 的 `*r = sat` 同一手法。上面那次 fast_read 已经
     // 证明这一页可读；CShipSize 是游戏自己刚写过的堆对象，可写是必然的。
